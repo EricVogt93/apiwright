@@ -1,0 +1,10 @@
+/target
+/.claude/worktrees/
+**/*.rs.bk
+*.pdb
+.forge-local/
+*.secrets.json
+.env.local
+.forge/
+.codesearch.db/
+/crates/forge-pro/

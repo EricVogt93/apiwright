@@ -1,0 +1,18 @@
+info:
+  name: Unsupported contract transform
+  type: http
+  seq: 4
+http:
+  method: get
+  url: https://example.test/unsupported
+runtime:
+  scripts:
+    - type: tests
+      code: |
+        const { validateContract } = require('./shared/contracts/validate.js');
+        test("returns 200 despite blocked contract", function() {
+          expect(res.status).to.equal(200);
+        });
+        test("nested response transform is blocked", function() {
+          validateContract('response', res.body.payload, expect);
+        });

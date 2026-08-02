@@ -1,0 +1,6 @@
+info:
+  name: Shared is not a request root
+  type: http
+http:
+  method: get
+  url: https://example.test/must-not-import

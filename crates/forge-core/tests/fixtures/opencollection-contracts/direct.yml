@@ -1,0 +1,18 @@
+info:
+  name: Direct contract
+  type: http
+  seq: 1
+http:
+  method: get
+  url: https://example.test/direct
+runtime:
+  scripts:
+    - type: tests
+      code: |
+        test("returns 200", function() {
+          expect(res.status).to.equal(200);
+        });
+        test("response matches the compact contract", function() {
+          const { validateContract } = require('./shared/contracts/validate.js');
+          validateContract('response', res.body, expect);
+        });

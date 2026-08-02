@@ -1,0 +1,7 @@
+info:
+  name: First
+  type: folder
+  seq: 1
+  tags: [folder-tag]
+docs:
+  content: First leaf documentation.

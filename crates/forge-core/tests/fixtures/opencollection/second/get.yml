@@ -1,0 +1,8 @@
+info:
+  name: Get created user
+  type: http
+  seq: 1
+http:
+  method: get
+  url: "{{base_url}}/users/{{created_id}}"
+  auth: inherit

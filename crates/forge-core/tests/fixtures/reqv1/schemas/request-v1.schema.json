@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forge.dev/schemas/request-v1.schema.json",
+  "title": "Forge request document (v1)",
+  "description": "A single API request. Request-specific config plus references to reusable assets. Exactly one request per file.",
+  "type": "object",
+  "required": ["formatVersion", "kind", "meta", "request"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "formatVersion": { "const": 1 },
+    "kind": { "const": "request" },
+
+    "meta": {
+      "type": "object",
+      "required": ["id", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9._-]+$",
+          "description": "Stable identifier, unique within the project."
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "bindings": {
+      "type": "object",
+      "description": "Named values resolved before the request runs. value | ref | use.",
+      "additionalProperties": { "$ref": "#/$defs/binding" }
+    },
+
+    "matrix": {
+      "type": "object",
+      "description": "Parameterized execution: one run per element of each named iteration source. Referenced as ${matrix.<name>}.",
+      "additionalProperties": { "$ref": "#/$defs/binding" }
+    },
+
+    "execution": { "$ref": "#/$defs/executionPolicy" },
+
+    "auth": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Explicit named project auth provider, or 'none' to disable automatic auth."
+    },
+
+    "request": {
+      "type": "object",
+      "required": ["method", "url"],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"]
+        },
+        "url": { "type": "string", "minLength": 1 },
+        "headers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/header" }
+        },
+        "query": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/header" }
+        },
+        "body": { "$ref": "#/$defs/body" },
+        "settings": { "$ref": "#/$defs/requestSettings" }
+      }
+    },
+
+    "pipeline": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/pipelineEntry" }
+    },
+
+    "mock": { "$ref": "#/$defs/mock" }
+  },
+
+  "$defs": {
+    "assetRef": {
+      "type": "string",
+      "description": "alias-or-path[#json-pointer][@version]. Forward slashes only.",
+      "pattern": "^[^\\\\]+$"
+    },
+
+    "jsonPatch": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["op", "path"],
+        "properties": {
+          "op": { "enum": ["add", "remove", "replace", "move", "copy", "test"] },
+          "path": { "type": "string" },
+          "from": { "type": "string" },
+          "value": {}
+        }
+      }
+    },
+
+    "binding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["value"],
+          "additionalProperties": false,
+          "properties": { "value": {} }
+        },
+        {
+          "type": "object",
+          "required": ["ref"],
+          "additionalProperties": false,
+          "properties": {
+            "ref": { "$ref": "#/$defs/assetRef" },
+            "patch": { "$ref": "#/$defs/jsonPatch" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["use"],
+          "additionalProperties": false,
+          "properties": {
+            "use": { "$ref": "#/$defs/assetRef" },
+            "with": { "type": "object" }
+          }
+        }
+      ]
+    },
+
+    "header": {
+      "type": "object",
+      "required": ["name", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": { "type": "string" },
+        "enabled": { "type": "boolean", "default": true }
+      }
+    },
+
+    "body": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "parts"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "multipart" },
+            "parts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/multipartPart" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "file"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "binary" },
+            "file": { "$ref": "#/$defs/assetRef" },
+            "contentType": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "enum": ["json", "text", "form", "none"] },
+            "value": {}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["ref"],
+          "additionalProperties": false,
+          "properties": {
+            "ref": { "$ref": "#/$defs/assetRef" },
+            "type": { "enum": ["json", "text", "form"] }
+          }
+        }
+      ]
+    },
+
+    "multipartPart": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "name", "value"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "text" },
+            "name": { "type": "string", "minLength": 1 },
+            "value": { "type": "string" },
+            "filename": { "type": "string", "minLength": 1 },
+            "contentType": { "type": "string", "minLength": 1 },
+            "enabled": { "type": "boolean", "default": true }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "name", "file"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "file" },
+            "name": { "type": "string", "minLength": 1 },
+            "file": { "$ref": "#/$defs/assetRef" },
+            "filename": { "type": "string", "minLength": 1 },
+            "contentType": { "type": "string", "minLength": 1 },
+            "enabled": { "type": "boolean", "default": true }
+          }
+        }
+      ]
+    },
+
+    "requestSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per-request timeout in milliseconds. Zero disables the timeout."
+        },
+        "followRedirects": { "type": "boolean" },
+        "maxRedirects": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "encodeUrl": { "type": "boolean", "default": true }
+      }
+    },
+
+    "executionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delayBeforeMs": { "type": "integer", "minimum": 0 },
+        "skip": { "$ref": "#/$defs/skipGuard" }
+      }
+    },
+
+    "skipGuard": {
+      "type": "object",
+      "required": ["when", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "when": { "$ref": "#/$defs/executionCondition" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "executionCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["literal"],
+          "additionalProperties": false,
+          "properties": { "literal": { "type": "boolean" } }
+        },
+        {
+          "type": "object",
+          "required": ["var"],
+          "additionalProperties": false,
+          "properties": { "var": { "$ref": "#/$defs/executionVariable" } }
+        },
+        {
+          "type": "object",
+          "required": ["not"],
+          "additionalProperties": false,
+          "properties": { "not": { "$ref": "#/$defs/executionCondition" } }
+        },
+        {
+          "type": "object",
+          "required": ["all"],
+          "additionalProperties": false,
+          "properties": {
+            "all": { "type": "array", "items": { "$ref": "#/$defs/executionCondition" } }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["any"],
+          "additionalProperties": false,
+          "properties": {
+            "any": { "type": "array", "items": { "$ref": "#/$defs/executionCondition" } }
+          }
+        }
+      ]
+    },
+
+    "executionVariable": {
+      "type": "object",
+      "required": ["scope", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "enum": ["env", "secret", "runtime"] },
+        "name": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "pipelineEntry": {
+      "type": "object",
+      "required": ["phase", "use"],
+      "additionalProperties": false,
+      "properties": {
+        "phase": { "enum": ["beforeRequest", "afterResponse", "onError", "finally"] },
+        "use": { "$ref": "#/$defs/assetRef" },
+        "with": { "type": "object" },
+        "enabled": { "type": "boolean", "default": true }
+      }
+    },
+
+    "mock": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+            "headers": { "type": "array", "items": { "$ref": "#/$defs/header" } },
+            "body": { "$ref": "#/$defs/body" },
+            "delayMs": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["use"],
+          "additionalProperties": false,
+          "properties": {
+            "use": { "$ref": "#/$defs/assetRef" },
+            "with": { "type": "object" }
+          }
+        }
+      ]
+    }
+  }
+}

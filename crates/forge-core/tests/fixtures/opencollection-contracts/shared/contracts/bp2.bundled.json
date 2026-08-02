@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "identifier": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "response": {
+      "type": "object",
+      "required": ["item", "createdAt", "contact"],
+      "properties": {
+        "item": { "$ref": "#/$defs/identifier" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "contact": { "type": "string", "format": "idn-email" }
+      },
+      "additionalProperties": false
+    },
+    "page": {
+      "type": "object",
+      "required": ["data"],
+      "properties": {
+        "data": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/identifier" }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

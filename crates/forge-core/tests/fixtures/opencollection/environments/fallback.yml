@@ -1,0 +1,10 @@
+variables:
+  - name: base_url
+    value: https://example.test
+  - name: user_name
+    value: Ada
+  - name: api_token
+    secret: true
+    value: must-not-be-exported
+  - name: Client_Secret
+    value: synthetic-sensitive-value

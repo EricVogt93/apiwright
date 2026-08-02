@@ -1,0 +1,20 @@
+name: TS quarantine verification
+
+on:
+  push:
+    branches:
+      - ts/quarantine-import-verify
+
+jobs:
+  verify:
+    runs-on: ts-heavy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Check release GUI
+        run: cargo check --release --locked -p forge-gui --bin apiwright-ide

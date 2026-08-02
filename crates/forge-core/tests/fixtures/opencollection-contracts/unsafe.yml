@@ -1,0 +1,15 @@
+info:
+  name: Unrecognized require
+  type: http
+  seq: 5
+http:
+  method: get
+  url: https://example.test/unsafe
+runtime:
+  scripts:
+    - type: tests
+      code: |
+        const fs = require('fs');
+        test("must remain blocked", function() {
+          expect(fs.readFileSync('/tmp/not-allowed')).to.equal('never');
+        });

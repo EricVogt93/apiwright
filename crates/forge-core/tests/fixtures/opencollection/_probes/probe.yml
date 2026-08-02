@@ -1,0 +1,7 @@
+info:
+  name: Probe
+  type: http
+  seq: 1
+http:
+  method: get
+  url: https://probe.test

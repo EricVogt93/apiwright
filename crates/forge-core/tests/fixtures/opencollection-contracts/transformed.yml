@@ -1,0 +1,19 @@
+info:
+  name: Transformed contract
+  type: http
+  seq: 2
+http:
+  method: get
+  url: https://example.test/transformed
+runtime:
+  scripts:
+    - type: tests
+      code: |
+        const { validateContract } = require('./shared/contracts/validate.js');
+        test("returns 200", function() {
+          expect(res.status).to.equal(200);
+        });
+        test("page envelope ignores source rows", function() {
+          const envelope = Object.assign({}, res.body, { data: [] });
+          validateContract('page', envelope, expect);
+        });
