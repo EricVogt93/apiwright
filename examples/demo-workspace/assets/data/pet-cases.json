@@ -1,6 +1,0 @@
-{
-  "cases": [
-    { "id": 42, "expectedName": "Ada" },
-    { "id": 43, "expectedName": "Grace" }
-  ]
-}

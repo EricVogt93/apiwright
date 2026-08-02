@@ -1,2 +1,0 @@
-GET {{baseUrl}}/{{apiVersion}}/users/{{userId}}
-Authorization: Bearer {{token}}

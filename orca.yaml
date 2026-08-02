@@ -1,4 +1,0 @@
-scripts:
-  setup: |
-    set -eu
-    cargo fetch --locked
