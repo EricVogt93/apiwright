@@ -217,6 +217,9 @@ impl ProjectIndex {
 
     fn collect_environments(&mut self, root: &Path) {
         let dir = root.join("environments");
+        if dir.is_symlink() {
+            return;
+        }
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
@@ -460,11 +463,17 @@ fn classify(path: &Path, ext: &str) -> AssetKind {
 }
 
 fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if dir.is_symlink() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let p = entry.path();
+        if p.is_symlink() {
+            continue;
+        }
         if p.is_dir() {
             // Skip hidden/generated/VCS dirs.
             if crate::is_ignored_dir(&entry.file_name().to_string_lossy()) {
@@ -687,5 +696,42 @@ mod tests {
             &root.join("assets/data/users.json"),
         );
         assert_eq!(rel, "../../assets/data/users.json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_scan_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("project.json"), "{}").unwrap();
+        std::fs::create_dir(project.path().join("requests")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("escaped.request.json"),
+            r#"{
+                "formatVersion": 1,
+                "kind": "request",
+                "meta": {"id": "escaped", "name": "Escaped"},
+                "request": {"method": "GET", "url": "https://example.test"}
+            }"#,
+        )
+        .unwrap();
+        symlink(
+            outside.path(),
+            project.path().join("requests").join("outside"),
+        )
+        .unwrap();
+        let outside_assets = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside_assets.path().join("external.js"),
+            "export function run() {}",
+        )
+        .unwrap();
+        symlink(outside_assets.path(), project.path().join("assets")).unwrap();
+
+        let index = ProjectIndex::scan(project.path()).unwrap();
+        assert!(index.requests.is_empty());
+        assert!(index.assets.is_empty());
     }
 }

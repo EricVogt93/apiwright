@@ -13,6 +13,7 @@ pub use ops::*;
 pub use variables::*;
 pub use workspace::*;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -74,10 +75,33 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> StoreResult<()> {
         source,
     })?;
     text.push('\n');
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+    atomic_write(path, |file| file.write_all(text.as_bytes()))
+}
+
+fn atomic_write(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> StoreResult<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(io_err(path))?;
+    match std::fs::metadata(path) {
+        Ok(metadata) => staged
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(io_err(path))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_err(path)(error)),
     }
-    std::fs::write(path, text).map_err(io_err(path))
+    write(staged.as_file_mut()).map_err(io_err(path))?;
+    staged.as_file().sync_all().map_err(io_err(path))?;
+    staged
+        .persist(path)
+        .map_err(|error| io_err(path)(error.error))?;
+    Ok(())
 }
 
 /// Validate a user-supplied file/folder name.
@@ -107,5 +131,29 @@ pub fn slugify(name: &str) -> String {
         "unnamed".to_string()
     } else {
         trimmed
+    }
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::*;
+
+    #[test]
+    fn write_failure_preserves_previous_bytes_and_removes_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("request.json");
+        std::fs::write(&path, b"previous bytes\n").unwrap();
+        let result = atomic_write(&path, |file| {
+            file.write_all(b"partial new bytes")?;
+            Err(std::io::Error::other("injected disk write failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous bytes\n");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        save_json(&path, &serde_json::json!({"saved": true})).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "{\n  \"saved\": true\n}\n"
+        );
     }
 }

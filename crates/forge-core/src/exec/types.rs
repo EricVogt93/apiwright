@@ -212,6 +212,8 @@ pub struct Hop {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
+    #[error("decoded response exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: usize },
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
     #[error("request cancelled")]

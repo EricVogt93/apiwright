@@ -638,3 +638,79 @@ async fn oauth_error_response_surfaces_as_exec_error() {
     .expect_err("should fail");
     assert!(matches!(err, ExecError::OAuth(_)));
 }
+
+#[tokio::test]
+async fn response_limit_accepts_boundary_and_rejects_one_more_byte() {
+    let server = MockServer::start().await;
+    Mock::given(path("/body"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("12345"))
+        .mount(&server)
+        .await;
+    let exact = HttpEngine::with_max_response_bytes(5)
+        .execute(
+            get(format!("{}/body", server.uri())),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact.body, b"12345");
+    assert_eq!(exact.size.body_bytes, 5);
+    let error = HttpEngine::with_max_response_bytes(4)
+        .execute(
+            get(format!("{}/body", server.uri())),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExecError::ResponseTooLarge { limit: 4 }));
+}
+
+#[tokio::test]
+async fn response_limit_applies_to_decoded_gzip() {
+    let server = MockServer::start().await;
+    Mock::given(path("/gzip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-encoding", "gzip")
+                .set_body_raw(GZIPPED_JSON.to_vec(), "application/octet-stream"),
+        )
+        .mount(&server)
+        .await;
+    let error = HttpEngine::with_max_response_bytes(10)
+        .execute(
+            get(format!("{}/gzip", server.uri())),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExecError::ResponseTooLarge { limit: 10 }));
+}
+
+#[tokio::test]
+async fn response_limit_applies_to_chunked_body_without_content_length() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n").await.unwrap();
+    });
+    let error = HttpEngine::with_max_response_bytes(5)
+        .execute(get(format!("http://{addr}")), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExecError::ResponseTooLarge { limit: 5 }));
+    server.await.unwrap();
+}

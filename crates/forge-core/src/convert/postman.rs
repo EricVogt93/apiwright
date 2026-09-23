@@ -40,6 +40,10 @@ pub struct ImportedCollection {
     pub description: String,
     /// Collection-level `{{variables}}` (name → current/initial value).
     pub variables: BTreeMap<String, String>,
+    /// Collection-scoped secret variables kept out of committed metadata.
+    /// Values remain in memory only until the GUI can write the ignored
+    /// sibling secret store.
+    pub secret_variables: SecretValues,
     /// Collection-level auth (`Inherit` when absent).
     pub auth: AuthConfig,
     /// Collection-level lifecycle hooks (from Postman collection events).
@@ -115,10 +119,19 @@ pub fn parse_postman(text: &str) -> Result<ImportedCollection, PostmanError> {
     );
 
     let mut variables = BTreeMap::new();
+    let mut secret_variables = SecretValues::new();
     if let Some(vars) = root["variable"].as_array() {
         for v in vars {
             if let Some(key) = v["key"].as_str() {
-                variables.insert(key.to_string(), value_as_string(&v["value"]));
+                let value = value_as_string(&v["value"]);
+                if v["type"].as_str() == Some("secret") {
+                    secret_variables.insert(key.to_string(), value);
+                    skipped.push(format!(
+                        "collection: secret variable '{key}' is stored separately from the project environment"
+                    ));
+                } else {
+                    variables.insert(key.to_string(), value);
+                }
             }
         }
     }
@@ -129,6 +142,7 @@ pub fn parse_postman(text: &str) -> Result<ImportedCollection, PostmanError> {
         name,
         description: description_text(&info["description"]),
         variables,
+        secret_variables,
         auth,
         hooks: SuiteHooks::default(),
         items,
@@ -380,11 +394,13 @@ fn parse_url(url: &Value) -> (String, Vec<Param>) {
         }
     };
 
+    let mut has_structured_query = false;
     if let Some(query) = url["query"].as_array() {
         for q in query {
             let Some(key) = q["key"].as_str() else {
                 continue;
             };
+            has_structured_query = true;
             params.push(Param {
                 kv: KeyValue {
                     key: key.to_string(),
@@ -413,8 +429,31 @@ fn parse_url(url: &Value) -> (String, Vec<Param>) {
         }
     }
 
-    // Query params live in the params table; keep the URL itself clean.
-    let base = raw.split('?').next().unwrap_or(&raw).to_string();
+    // String URLs and Postman exports without a structured query array still
+    // carry their parameters in `raw`. Prefer the structured form when it is
+    // present because it also preserves disabled entries and descriptions.
+    let fragment_start = raw.find('#').unwrap_or(raw.len());
+    let before_fragment = &raw[..fragment_start];
+    let fragment = &raw[fragment_start..];
+    let (base, embedded_query) = before_fragment
+        .split_once('?')
+        .map_or((before_fragment, None), |(base, query)| (base, Some(query)));
+    if !has_structured_query {
+        if let Some(query) = embedded_query {
+            params.extend(
+                url::form_urlencoded::parse(query.as_bytes()).map(|(key, value)| Param {
+                    kv: KeyValue {
+                        key: key.into_owned(),
+                        value: value.into_owned(),
+                        description: String::new(),
+                        enabled: true,
+                    },
+                    kind: ParamKind::Query,
+                }),
+            );
+        }
+    }
+    let base = format!("{base}{fragment}");
     (base, params)
 }
 

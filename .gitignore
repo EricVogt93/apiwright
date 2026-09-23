@@ -2,9 +2,9 @@
 /.claude/worktrees/
 **/*.rs.bk
 *.pdb
+__pycache__/
 .forge-local/
 *.secrets.json
 .env.local
 .forge/
-.codesearch.db/
 /crates/forge-pro/

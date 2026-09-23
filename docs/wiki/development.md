@@ -20,7 +20,7 @@ Core and CLI work do not require the desktop windowing headers.
 
 ```sh
 cargo build --workspace
-cargo run -p forge-gui --bin forge-ide
+cargo run -p forge-gui --bin apiwright-ide
 cargo run -p forge-cli -- --help
 cargo build --release --locked --workspace
 ```
@@ -45,7 +45,7 @@ a pull request:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo check --release --locked -p forge-gui --bin forge-ide
+cargo check --release --locked -p forge-gui --bin apiwright-ide
 ```
 
 These are the checks in `.github/workflows/ci.yml`. CI runs on pushes to
@@ -127,3 +127,16 @@ boundary requires one.
 
 Finish documentation-only work with `git diff --check`. For code changes,
 report the exact focused and workspace commands you actually executed.
+
+## Request editor modules
+
+`crates/forge-gui/src/dialogs/v1_editor.rs` owns the shared editor state and
+module wiring. Its `v1_editor/` directory separates document loading and
+revision-aware saving (`document.rs`), run/stop commands (`execution.rs`),
+layout (`view.rs`), OpenAPI tools, advisor, catalog, authentication, pipeline
+editing, results, and regression tests. Keep new behavior in its owning module;
+shared execution and storage guarantees belong in `forge-core`.
+
+For a responsive desktop during local checks, use `cargo test --workspace
+--locked -j 2 -- --test-threads=2`. The build-job limit controls compiler
+parallelism; the test-thread limit controls test execution.

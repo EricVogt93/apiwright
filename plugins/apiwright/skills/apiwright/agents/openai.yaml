@@ -1,0 +1,11 @@
+interface:
+  display_name: "ApiWright"
+  short_description: "Inspect, edit, validate, and run API tests"
+  default_prompt: "Use $apiwright to inspect this API project, update its saved request files, validate them, and run only the checks I authorize."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "apiwright"
+      description: "Local ApiWright project inspection, validation, writes, and runs"
+policy:
+  allow_implicit_invocation: true

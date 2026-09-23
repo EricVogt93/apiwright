@@ -55,6 +55,7 @@ fn tls_fingerprint(client_pem: Option<&[u8]>, extra_roots_pem: Option<&[u8]>) ->
 pub struct HttpEngine {
     clients: Mutex<HashMap<ClientKey, reqwest::Client>>,
     cookies: CookieJar,
+    max_response_bytes: usize,
 }
 
 impl Default for HttpEngine {
@@ -65,9 +66,16 @@ impl Default for HttpEngine {
 
 impl HttpEngine {
     pub fn new() -> Self {
+        Self::with_max_response_bytes(32 * 1024 * 1024)
+    }
+
+    /// Limit decoded response bodies, including responses without Content-Length.
+    /// Exceeding the limit fails the request; partial bodies are never asserted.
+    pub fn with_max_response_bytes(max_response_bytes: usize) -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
             cookies: CookieJar::new(),
+            max_response_bytes,
         }
     }
 
@@ -196,6 +204,9 @@ impl HttpEngine {
         let mut hop_count: u32 = 0;
         let mut digest_answered = false;
         let mut ntlm_state = NtlmState::Fresh;
+        // Once we leave the original origin, never reuse its authentication,
+        // even if a later redirect returns to it.
+        let mut auth_allowed = true;
 
         loop {
             if cancel.is_cancelled() {
@@ -204,7 +215,7 @@ impl HttpEngine {
 
             let jar_pairs = self.cookies.matching(&current_url);
             let mut leg_headers = merge_cookie_header(&current_headers, &jar_pairs);
-            if let Some(sigv4) = &req.sigv4 {
+            if let Some(sigv4) = req.sigv4.as_ref().filter(|_| auth_allowed) {
                 apply_sigv4(
                     &mut leg_headers,
                     sigv4,
@@ -245,7 +256,7 @@ impl HttpEngine {
             // connection (the client for NTLM requests is HTTP/1.1-only
             // with a single-connection pool).
             if status.as_u16() == 401 && ntlm_state != NtlmState::Done {
-                if let Some(creds) = &req.ntlm {
+                if let Some(creds) = req.ntlm.as_ref().filter(|_| auth_allowed) {
                     let ntlm_challenge = response
                         .headers()
                         .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -278,7 +289,7 @@ impl HttpEngine {
             // Digest auth: answer the server's 401 challenge once, then
             // retry the same request with the computed Authorization.
             if status.as_u16() == 401 && !digest_answered {
-                if let Some(creds) = &req.digest {
+                if let Some(creds) = req.digest.as_ref().filter(|_| auth_allowed) {
                     let challenge = response
                         .headers()
                         .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -326,6 +337,7 @@ impl HttpEngine {
                     };
 
                     if origin_of(&current_url) != origin_of(&next_url) {
+                        auth_allowed = false;
                         // Cookie-jar cookies are already scoped per-hop by
                         // the jar itself; an explicit user-set `Cookie`
                         // header is not, so it must be stripped here too —
@@ -333,6 +345,7 @@ impl HttpEngine {
                         current_headers.retain(|(k, _)| {
                             !k.eq_ignore_ascii_case("authorization")
                                 && !k.eq_ignore_ascii_case("cookie")
+                                && !k.eq_ignore_ascii_case("x-amz-security-token")
                         });
                     }
 
@@ -372,9 +385,20 @@ impl HttpEngine {
             let status_code = status.as_u16();
 
             let body_start = Instant::now();
-            let body = race(response.bytes(), &cancel)
+            let mut response = response;
+            let mut body = Vec::new();
+            while let Some(chunk) = race(response.chunk(), &cancel)
                 .await?
-                .map_err(|e| map_reqwest_error(e, req.timeout))?;
+                .map_err(|e| map_reqwest_error(e, req.timeout))?
+            {
+                if chunk.len() > self.max_response_bytes.saturating_sub(body.len()) {
+                    return Err(ExecError::ResponseTooLarge {
+                        limit: self.max_response_bytes,
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let body_bytes = body.len() as u64;
             let download = body_start.elapsed();
             let total = overall_start.elapsed();
 
@@ -383,7 +407,7 @@ impl HttpEngine {
                 status_text,
                 http_version: version.to_string(),
                 headers: response_headers,
-                body: body.to_vec(),
+                body,
                 timing: TimingBreakdown {
                     dns: None,
                     connect_tls: None,
@@ -396,7 +420,7 @@ impl HttpEngine {
                 size: Sizes {
                     request_bytes,
                     header_bytes,
-                    body_bytes: body.len() as u64,
+                    body_bytes,
                 },
                 effective_url,
                 redirect_chain,

@@ -101,11 +101,20 @@ pub fn handle_global_shortcuts(ctx: &egui::Context, state: &mut AppState) {
 pub fn dispatch_action(state: &mut AppState, bridge: &Bridge, action: ActionId) {
     match action {
         ActionId::Save => {
-            if let Some(idx) = state.active_tab {
+            if state.dialogs.v1_editor.open {
+                if state.dialogs.v1_editor.has_unsaved_edits() {
+                    state.dialogs.v1_editor.save();
+                }
+            } else if let Some(idx) = state.active_tab {
                 crate::app::save_tab(state, idx);
             }
         }
-        ActionId::SaveAll => crate::app::save_all(state),
+        ActionId::SaveAll => {
+            if state.dialogs.v1_editor.open && state.dialogs.v1_editor.has_unsaved_edits() {
+                state.dialogs.v1_editor.save();
+            }
+            crate::app::save_all(state);
+        }
         ActionId::Send => request_editor::send_active(state, bridge),
         ActionId::CloseTab => {
             if let Some(idx) = state.active_tab {

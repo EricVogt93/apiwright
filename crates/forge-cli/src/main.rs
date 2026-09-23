@@ -1,3 +1,4 @@
+mod mcp;
 mod print;
 
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve ApiWright project tools over MCP stdio.
+    Mcp,
     /// Run a request, folder, collection or the whole workspace.
     Run(RunArgs),
     /// List every collection, folder and request in a workspace.
@@ -313,6 +316,13 @@ struct RunArgs {
 async fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
+        Command::Mcp => match mcp::serve().await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("MCP server error: {error:#}");
+                2
+            }
+        },
         Command::Run(args) => cmd_run(args).await,
         Command::List(args) => cmd_list(&args.workspace),
         Command::Envs(args) => cmd_envs(&args.workspace),
@@ -641,9 +651,14 @@ fn cmd_import(args: &ImportArgs) -> i32 {
     match forge_core::reqv1::import_bundle(&args.bundle, &args.destination) {
         Ok(summary) => {
             println!(
-                "imported {} file(s) below {}",
+                "imported {} file(s) below {}{}",
                 summary.files.len(),
-                args.destination.display()
+                args.destination.display(),
+                if summary.preserved_project_config {
+                    " (kept existing project.json)"
+                } else {
+                    ""
+                }
             );
             0
         }

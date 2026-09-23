@@ -2,7 +2,7 @@
 //! operations to bring in, and generate a whole collection — requests,
 //! optional contract-test assertions and the spec-to-collection binding.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use egui::{RichText, Window};
 
@@ -66,7 +66,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     if !state.dialogs.openapi_import.open {
         return;
     }
-    let Some(workspace) = state.workspace.clone() else {
+    let workspace = state.workspace.clone();
+    let Some(root) = workspace
+        .as_ref()
+        .map(|workspace| workspace.root.clone())
+        .or_else(|| state.assets.project_root())
+    else {
         state.dialogs.openapi_import.open = false;
         state.status = Some(StatusMessage::error("Open a workspace before importing"));
         return;
@@ -109,6 +114,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                         "Generate contract assertions",
                     );
                     ui.checkbox(&mut dialog.copy_spec, "Copy spec into workspace specs/ dir");
+                    if root.join("project.json").is_file() && !dialog.copy_spec {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "Request-v1 projects require a project-relative spec. Enable Copy spec to keep the contract portable.",
+                        );
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("Select all").clicked() {
@@ -164,6 +175,14 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 }
                 let can_import = matches!(&state.dialogs.openapi_import.spec, Some(Ok(_)))
                     && state.dialogs.openapi_import.selected.iter().any(|s| *s)
+                    && (!root.join("project.json").is_file()
+                        || state.dialogs.openapi_import.copy_spec
+                        || state
+                            .dialogs
+                            .openapi_import
+                            .spec_path
+                            .as_ref()
+                            .is_some_and(|path| path.starts_with(&root)))
                     && !state
                         .dialogs
                         .openapi_import
@@ -180,7 +199,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
         });
 
     if import_clicked {
-        if let Err(e) = do_import(&workspace, &mut state.dialogs.openapi_import) {
+        if let Err(e) = do_import(&root, &mut state.dialogs.openapi_import) {
             state.status = Some(StatusMessage::error(e));
         } else {
             state.dialogs.openapi_import.open = false;
@@ -193,7 +212,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     }
 }
 
-fn do_import(workspace: &Workspace, dialog: &mut OpenApiImportState) -> Result<(), String> {
+fn do_import(root: &Path, dialog: &mut OpenApiImportState) -> Result<(), String> {
     let Some(Ok(spec)) = &dialog.spec else {
         return Err("no spec loaded".to_string());
     };
@@ -201,22 +220,49 @@ fn do_import(workspace: &Workspace, dialog: &mut OpenApiImportState) -> Result<(
         return Err("no spec file".to_string());
     };
 
-    let col_dir = create_collection(&workspace.root, dialog.collection_name.trim())
-        .map_err(|e| e.to_string())?;
-
+    let mut copied_spec = None;
     let spec_rel_path = if dialog.copy_spec {
-        let specs_dir = workspace.root.join(SPECS_DIR);
+        let specs_dir = root.join(SPECS_DIR);
         std::fs::create_dir_all(&specs_dir).map_err(|e| e.to_string())?;
+        let canonical_root = root.canonicalize().map_err(|error| error.to_string())?;
+        let canonical_specs = specs_dir
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        if !canonical_specs.starts_with(&canonical_root) {
+            return Err("specs directory resolves outside the project".to_string());
+        }
         let file_name = spec_source
             .file_name()
-            .map(|n| n.to_owned())
-            .unwrap_or_else(|| "spec.yaml".into());
-        let dest = specs_dir.join(&file_name);
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "spec.yaml".to_string());
+        let (dest, stored_name) = available_spec_path(&specs_dir, &file_name);
         std::fs::copy(spec_source, &dest).map_err(|e| e.to_string())?;
-        format!("{SPECS_DIR}/{}", file_name.to_string_lossy())
+        copied_spec = Some(dest);
+        format!("{SPECS_DIR}/{stored_name}")
     } else {
-        spec_source.display().to_string()
+        let canonical_root = root.canonicalize().map_err(|error| error.to_string())?;
+        let canonical_spec = spec_source
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let relative = canonical_spec.strip_prefix(&canonical_root).map_err(|_| {
+            "the selected spec is outside this project; enable Copy spec to import it safely"
+                .to_string()
+        })?;
+        relative.to_string_lossy().replace('\\', "/")
     };
+
+    if root.join("project.json").is_file() {
+        let result = import_request_v1(root, dialog, spec, &spec_rel_path);
+        if result.is_err() {
+            if let Some(path) = copied_spec {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        return result;
+    }
+
+    let col_dir =
+        create_collection(root, dialog.collection_name.trim()).map_err(|e| e.to_string())?;
 
     let mut pairs: Vec<(String, String)> = Vec::new();
     for (i, op) in spec.operations.iter().enumerate() {
@@ -250,12 +296,172 @@ fn do_import(workspace: &Workspace, dialog: &mut OpenApiImportState) -> Result<(
     Ok(())
 }
 
+fn import_request_v1(
+    root: &Path,
+    dialog: &OpenApiImportState,
+    spec: &ParsedSpec,
+    spec_rel_path: &str,
+) -> Result<(), String> {
+    let requests = root.join("requests");
+    std::fs::create_dir_all(&requests).map_err(|error| error.to_string())?;
+    let canonical_root = root.canonicalize().map_err(|error| error.to_string())?;
+    let canonical_requests = requests.canonicalize().map_err(|error| error.to_string())?;
+    if !canonical_requests.starts_with(&canonical_root) {
+        return Err("requests directory resolves outside the project".to_string());
+    }
+    let base = slug(&dialog.collection_name);
+    let base = if base.is_empty() { "openapi" } else { &base };
+    let mut target = canonical_requests.join(base);
+    let mut suffix = 2;
+    while target.exists() {
+        target = requests.join(format!("{base}-{suffix}"));
+        suffix += 1;
+    }
+    std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+
+    let result = (|| {
+        forge_core::reqv1::set_openapi(&target, spec_rel_path)?;
+        for (index, operation) in spec.operations.iter().enumerate() {
+            if !dialog.selected.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut definition = operation_to_request(operation);
+            if definition.auth.is_inherit() {
+                definition.auth = forge_core::model::AuthConfig::None;
+            }
+            if dialog.generate_contract {
+                definition.assertions = contract_checks(operation, None)
+                    .into_iter()
+                    .map(|check| {
+                        let mut assertion: forge_core::model::AssertionDef = check.into();
+                        assertion.note = "contract".to_string();
+                        assertion
+                    })
+                    .collect();
+            }
+            let id = slug(&operation.id);
+            let id = if id.is_empty() {
+                format!("operation-{}", index + 1)
+            } else {
+                id
+            };
+            definition.name = if operation.summary.trim().is_empty() {
+                operation.id.clone()
+            } else {
+                operation.summary.clone()
+            };
+            let document = forge_core::reqv1::migrate_request(&definition, &id)
+                .map_err(|error| format!("cannot import operation {}: {error}", operation.id))?;
+            let file = forge_core::reqv1::available_path(&target, &id, ".request.json");
+            forge_core::reqv1::save_request_document(
+                &file,
+                document,
+                forge_core::reqv1::AssertionDocument::default(),
+                forge_core::reqv1::HookDocument::default(),
+                true,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&target);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn available_spec_path(directory: &Path, file_name: &str) -> (PathBuf, String) {
+    let original = Path::new(file_name);
+    let stem = original
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "spec".to_string());
+    let extension = original
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        .unwrap_or_default();
+    let mut candidate = file_name.to_string();
+    let mut suffix = 2;
+    while directory.join(&candidate).exists() {
+        candidate = format!("{stem}-{suffix}{extension}");
+        suffix += 1;
+    }
+    (directory.join(&candidate), candidate)
+}
+
+fn slug(value: &str) -> String {
+    let mut out = String::new();
+    let mut separator = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            separator = false;
+        } else if !separator && !out.is_empty() {
+            out.push('-');
+            separator = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 fn reload_workspace(state: &mut AppState) {
-    let Some(root) = state.workspace.as_ref().map(|w| w.root.clone()) else {
+    let Some(root) = state
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.root.clone())
+        .or_else(|| state.assets.project_root())
+    else {
         return;
     };
-    match Workspace::load(&root) {
-        Ok(ws) => state.workspace = Some(ws),
-        Err(e) => state.status = Some(StatusMessage::error(e.to_string())),
+    state.assets.load(root.clone());
+    if state.workspace.is_some() {
+        match Workspace::load(&root) {
+            Ok(ws) => state.workspace = Some(ws),
+            Err(e) => state.status = Some(StatusMessage::error(e.to_string())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_v1_import_keeps_a_project_relative_contract_selection() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
+        let spec = parse_spec(
+            r#"{
+              "openapi":"3.0.0",
+              "info":{"title":"Pets","version":"1.0.0"},
+              "paths":{"/pets":{"get":{"operationId":"listPets","summary":"List pets","responses":{"200":{"description":"ok"}}}}}
+            }"#,
+        )
+        .unwrap();
+        let dialog = OpenApiImportState {
+            collection_name: "Pets API".to_string(),
+            generate_contract: false,
+            selected: vec![true; spec.operations.len()],
+            ..OpenApiImportState::default()
+        };
+
+        import_request_v1(root.path(), &dialog, &spec, "specs/pets.json").unwrap();
+
+        let request = root.path().join("requests/pets-api/listpets.request.json");
+        let document = forge_core::reqv1::load_request_document(&request).unwrap();
+        assert_eq!(document.meta.name, "List pets");
+        assert_eq!(document.request.method, forge_core::model::Method::Get);
+        let selection = forge_core::reqv1::effective_openapi(root.path(), &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.value, "specs/pets.json");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("requests/pets-api/.forge-openapi"))
+                .unwrap()
+                .trim(),
+            "specs/pets.json"
+        );
     }
 }

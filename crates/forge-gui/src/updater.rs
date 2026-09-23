@@ -140,11 +140,12 @@ impl PackageKind {
 
     fn matches(self, name: &str) -> bool {
         let name = name.to_ascii_lowercase();
-        match self {
-            Self::LinuxAppImage => name.ends_with("-linux-x86_64.appimage"),
-            Self::WindowsExe => name.ends_with("-windows-x86_64.exe"),
-            Self::MacDmg => name.ends_with("-macos-arm64.dmg"),
-        }
+        !name.contains("-cli-")
+            && match self {
+                Self::LinuxAppImage => name.ends_with("-linux-x86_64.appimage"),
+                Self::WindowsExe => name.ends_with("-windows-x86_64.exe"),
+                Self::MacDmg => name.ends_with("-macos-arm64.dmg"),
+            }
     }
 }
 
@@ -617,17 +618,18 @@ mod tests {
             "html_url": "https://example.test/release",
             "assets": [
                 {"name": "ApiWright-0.10.0-linux-x86_64.AppImage", "browser_download_url": "https://example.test/linux", "digest": "sha256:aa"},
+                {"name": "ApiWright-0.10.0-cli-windows-x86_64.exe", "browser_download_url": "https://example.test/cli", "digest": "sha256:cc"},
                 {"name": "ApiWright-0.10.0-windows-x86_64.exe", "browser_download_url": "https://example.test/windows", "digest": "sha256:bb"},
                 {"name": "SHA256SUMS.txt", "browser_download_url": "https://example.test/sums", "digest": null}
             ]
         }))
         .unwrap();
 
-        let selected = release_from_api(release, "0.9.9", Some(PackageKind::LinuxAppImage))
+        let selected = release_from_api(release, "0.9.9", Some(PackageKind::WindowsExe))
             .unwrap()
             .unwrap();
         assert_eq!(selected.version, "0.10.0");
-        assert_eq!(selected.asset.unwrap().url, "https://example.test/linux");
+        assert_eq!(selected.asset.unwrap().url, "https://example.test/windows");
     }
 
     #[test]

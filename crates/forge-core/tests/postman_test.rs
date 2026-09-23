@@ -35,6 +35,35 @@ fn imports_collection_metadata_variables_and_auth() {
 }
 
 #[test]
+fn collection_secret_variables_are_not_plain_collection_values() {
+    let import = parse_postman(
+        r#"{
+          "info":{"name":"Secrets"},
+          "variable":[
+            {"key":"baseUrl","value":"https://example.test"},
+            {"key":"token","value":"secret-value","type":"secret"}
+          ],
+          "item":[]
+        }"#,
+    )
+    .expect("collection should parse");
+
+    assert_eq!(
+        import.variables.get("baseUrl").map(String::as_str),
+        Some("https://example.test")
+    );
+    assert!(!import.variables.contains_key("token"));
+    assert_eq!(
+        import.secret_variables.get("token").map(String::as_str),
+        Some("secret-value")
+    );
+    assert!(import
+        .skipped
+        .iter()
+        .any(|warning| warning.contains("secret variable 'token'")));
+}
+
+#[test]
 fn imports_folder_tree_with_folder_level_auth() {
     let import = parse_postman(COLLECTION).expect("fixture should parse");
 
@@ -103,6 +132,38 @@ fn imports_request_with_headers_query_params_and_json_body() {
         panic!("json body, got {:?}", def.body)
     };
     assert!(text.contains("\"currency\": \"eur\""));
+}
+
+#[test]
+fn imports_query_parameters_embedded_in_a_raw_url() {
+    let import = parse_postman(
+        r#"{
+          "info":{"name":"Raw URL collection"},
+          "item":[{
+            "name":"Search",
+            "request":{
+              "method":"GET",
+              "url":"https://api.example.test/search?q=two%20words&empty=#summary"
+            }
+          }]
+        }"#,
+    )
+    .expect("collection should parse");
+    let ImportedItem::Request(request) = &import.items[0] else {
+        panic!("expected a request")
+    };
+
+    assert_eq!(request.url, "https://api.example.test/search#summary");
+    let query = request
+        .params
+        .iter()
+        .filter(|parameter| parameter.kind == ParamKind::Query)
+        .collect::<Vec<_>>();
+    assert_eq!(query.len(), 2);
+    assert_eq!(query[0].kv.key, "q");
+    assert_eq!(query[0].kv.value, "two words");
+    assert_eq!(query[1].kv.key, "empty");
+    assert_eq!(query[1].kv.value, "");
 }
 
 #[test]

@@ -2,19 +2,25 @@
 
 ## Project Structure & Module Organization
 
-This repository is a Rust 2021 Cargo workspace. Keep reusable application and domain logic in `crates/forge-core`; `crates/forge-cli` (`forge`) and `crates/forge-gui` (`forge-ide`) should remain thin adapters over that core. Core integration tests live in `crates/forge-core/tests`, with input data under `tests/fixtures`. Repository documentation is in `docs/`, JSON schemas in `schemas/`, and the runnable sample workspace is in `examples/demo-workspace`. GUI images and fonts belong in `crates/forge-gui/assets`.
+ApiWright is a Rust 2021 Cargo workspace. Shared application and domain logic belongs in `crates/forge-core`; `crates/forge-cli` (`apiwright`, including MCP) and `crates/forge-gui` (`apiwright-ide`) remain thin adapters. Integration tests live in each crate's `tests/` directory; core fixtures are in `crates/forge-core/tests/fixtures/`. Documentation is in `docs/` and `docs/wiki/`, schemas in `schemas/`, demo projects in `examples/demo-workspace`, and GUI assets in `crates/forge-gui/assets`. The Codex plugin lives in `plugins/apiwright`, with marketplace metadata in `.agents/plugins/`.
 
 ## Build, Test, and Development Commands
 
 - `cargo build --workspace` builds all crates in debug mode.
-- `cargo build --release` creates `target/release/forge` and `target/release/forge-ide`.
-- `cargo run -p forge-gui --bin forge-ide` starts the desktop IDE.
-- `cargo run -p forge-cli -- run examples/demo-workspace` runs the sample workspace through the CLI.
-- `cargo test --workspace` runs all unit and integration tests.
+- `cargo build --release --locked --workspace` creates `target/release/apiwright` and `target/release/apiwright-ide`.
+- `cargo run -p forge-gui --bin apiwright-ide` starts the desktop IDE.
+- `cargo test --workspace --locked` runs workspace tests.
 - `cargo fmt --all -- --check` verifies formatting.
 - `cargo clippy --workspace --all-targets -- -D warnings` treats lint warnings as failures.
+- `cargo check --release --locked -p forge-gui --bin apiwright-ide` checks release-only paths in CI.
 
-The GUI requires the Linux windowing development packages listed in `README.md`; core and CLI builds do not.
+Run the request-v1 demo offline with its reviewed project scripts:
+
+```sh
+cargo run -p forge-cli -- ci requests --root examples/demo-workspace --env demo --mock --allow-project-code
+```
+
+Linux GUI builds require the windowing packages listed in `README.md`.
 
 ## Coding Style & Naming Conventions
 
@@ -22,8 +28,12 @@ Use `rustfmt` defaults and four-space indentation. Follow Rust conventions: `sna
 
 ## Testing Guidelines
 
-Add integration tests as `crates/forge-core/tests/<feature>_test.rs`; place stable sample inputs in `tests/fixtures/<feature>/`. Use `#[tokio::test]` for async paths and local test servers such as `wiremock` instead of external services. Run the focused test first (for example, `cargo test -p forge-core --test runner_test`), then the full workspace suite. No coverage threshold is currently configured.
+Use `<feature>_test.rs`, `#[tokio::test]` for async paths, local servers such as `wiremock`, and `tempfile` for persistence. Run focused tests first, e.g. `cargo test -p forge-core --test reqv1_test`, then workspace checks. No coverage threshold is configured. Plugin changes also require `python3 -m unittest discover -s plugins/apiwright/scripts -p 'test_*.py'`; CI checks that plugin and workspace versions match.
+
+## Format Compatibility & Configuration
+
+For persisted-format changes, update models, matching schemas, `docs/architecture/request-format-v1.md`, and compatibility fixtures together. See `docs/wiki/mcp.md` for MCP trust and revision rules. Never commit `.forge-local/`, `.forge/`, `.env.local`, or `*.secrets.json`.
 
 ## Commit & Pull Request Guidelines
 
-Follow the existing concise, imperative history. Use a subsystem prefix when useful, such as `reqv1: validate sibling schemas` or `GUI: improve request editor`. Keep commits narrowly scoped. Pull requests should explain behavior changes, list executed checks, link relevant issues, and include screenshots for visible GUI changes. Never commit `.forge-local/`, `.forge/`, `.env.local`, or `*.secrets.json`.
+Follow recent history: concise, imperative messages using `fix(release): …`, `feat: …`, or `refactor: …`. Keep commits narrowly scoped. PRs should explain behavior changes, list executed checks, link relevant issues, and include screenshots for visible GUI changes.

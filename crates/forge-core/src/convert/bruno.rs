@@ -59,11 +59,22 @@ pub fn import_bruno(root: &Path) -> Result<BrunoImport, BrunoError> {
     // collection.bru: collection-level auth and docs.
     let mut auth = AuthConfig::Inherit;
     let mut description = String::new();
+    let mut variables = BTreeMap::new();
     let collection_bru = root.join("collection.bru");
     if let Ok(text) = std::fs::read_to_string(&collection_bru) {
         let blocks = parse_blocks(&text);
         auth = auth_from_blocks(&blocks, "collection", &mut skipped);
         description = text_block(&blocks, "docs").unwrap_or_default();
+        for (key, value, enabled) in dict_block(&blocks, "vars") {
+            if enabled {
+                variables.insert(key, value);
+            } else {
+                skipped.push(format!(
+                    "collection: variable '{key}' is disabled and was not imported"
+                ));
+            }
+        }
+        note_scripts(&blocks, "collection", &mut skipped);
     }
 
     let items = read_dir_items(root, "", true, &mut skipped)?;
@@ -87,17 +98,27 @@ pub fn import_bruno(root: &Path) -> Result<BrunoImport, BrunoError> {
         }
     }
 
+    let mut collection = ImportedCollection {
+        name,
+        description,
+        variables,
+        secret_variables: BTreeMap::new(),
+        auth,
+        hooks: SuiteHooks::default(),
+        items,
+        quarantine: Vec::new(),
+        skipped,
+    };
+    for (environment, _) in &environments {
+        for (name, variable) in &environment.variables {
+            if variable.secret {
+                collection.secret_variables.entry(name.clone()).or_default();
+            }
+        }
+    }
+    collection.quarantine = collect_bruno_quarantine(root)?;
     Ok(BrunoImport {
-        collection: ImportedCollection {
-            name,
-            description,
-            variables: BTreeMap::new(),
-            auth,
-            hooks: SuiteHooks::default(),
-            items,
-            quarantine: collect_bruno_quarantine(root)?,
-            skipped,
-        },
+        collection,
         environments,
     })
 }
@@ -691,6 +712,23 @@ fn extractors_from_blocks(
     out
 }
 
+fn note_scripts(blocks: &[(String, Block)], path: &str, skipped: &mut Vec<String>) {
+    for name in [
+        "script:pre-request",
+        "script:post-response",
+        "vars:pre-request",
+        "tests",
+    ] {
+        if blocks
+            .iter()
+            .any(|(n, b)| n == name && !b.as_text().trim().is_empty())
+        {
+            skipped.push(format!(
+                "{path}: {name} uses Bruno's bru/req/res JS API and was not imported"
+            ));
+        }
+    }
+}
 // ---------------------------------------------------------------------
 // Assert helpers
 // ---------------------------------------------------------------------

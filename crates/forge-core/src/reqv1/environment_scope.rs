@@ -24,7 +24,14 @@ fn environment_file(node: &Path) -> PathBuf {
 }
 
 pub fn own_environment(node: &Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(environment_file(node)) {
+    let path = environment_file(node);
+    if path.is_symlink() {
+        return Err(format!(
+            "refusing to read environment selection through symbolic link {}",
+            path.display()
+        ));
+    }
+    match std::fs::read_to_string(path) {
         Ok(value) => Ok((!value.trim().is_empty()).then(|| value.trim().to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!(
@@ -60,6 +67,12 @@ pub fn effective_environment(
 pub fn set_environment(node: &Path, value: &str) -> Result<(), String> {
     let value = validate_environment_name(value)?;
     let path = environment_file(node);
+    if path.is_symlink() {
+        return Err(format!(
+            "refusing to write environment selection through symbolic link {}",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -135,5 +148,40 @@ mod tests {
         assert!(set_environment(root.path(), "../secret").is_err());
         assert!(set_environment(root.path(), "story/dev").is_err());
         assert!(set_environment(root.path(), "").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_selection_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), root.path().join(FOLDER_ENVIRONMENT_FILE)).unwrap();
+
+        assert!(own_environment(root.path())
+            .unwrap_err()
+            .contains("symbolic link"));
+        assert!(set_environment(root.path(), "local")
+            .unwrap_err()
+            .contains("symbolic link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_directory_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("external.json"), "{}").unwrap();
+        symlink(outside.path(), root.path().join("environments")).unwrap();
+
+        assert!(
+            crate::reqv1::load_environment(root.path(), Some("external"))
+                .unwrap_err()
+                .message
+                .contains("symbolic link")
+        );
     }
 }

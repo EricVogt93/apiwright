@@ -9,7 +9,7 @@ modules rather than behind a trait for every dependency.
                     inbound adapters
              ┌─────────────┴─────────────┐
              │                           │
-      forge-gui (egui)            forge-cli (clap)
+      forge-gui (egui)       forge-cli (clap + MCP stdio)
              │                           │
              └──────────► forge-core ◄───┘
                               │
@@ -27,7 +27,7 @@ types, which prevents GUI-only execution semantics.
 | Crate | Responsibility | Must not own |
 | --- | --- | --- |
 | `forge-core` | Formats, domain models, validation, orchestration, transport, persistence, assertions, scripting and OpenAPI | egui widgets, dialogs, CLI parsing or terminal presentation |
-| `forge-cli` | clap commands, root/target selection, output formatting and process exit codes | alternate request semantics |
+| `forge-cli` | clap commands, MCP tools, root/target selection, output formatting and process exit codes | alternate request semantics |
 | `forge-gui` | egui state, panels, editors, dialogs, background bridge and desktop update UX | duplicated validation or runner rules |
 
 The dependency graph is enforced naturally by Cargo: `forge-cli` and
@@ -159,6 +159,14 @@ context and `advisor.rs` talks to an OpenAI-compatible provider. Core remains
 the authority for parsing, OpenAPI matching and execution data included in
 that context.
 
+`apiwright mcp` is an inbound adapter inside `forge-cli`. It exposes structured
+project inspection, revisioned request reads/writes, validation, and execution
+over stdio while calling the same `ProjectIndex`, sidecar save, validation, and
+runner functions as the other adapters. It accepts only absolute project roots
+and project-relative request paths. The filesystem is its state boundary:
+unsaved egui buffers are deliberately invisible. See
+[MCP and AI automation](mcp.md).
+
 ## Persistence boundaries
 
 - Versioned project inputs are normal JSON/YAML/JS files intended for Git.
@@ -178,6 +186,8 @@ Use the narrowest existing layer:
 - Execution semantics, persisted format behavior, diagnostics or reusable
   generation belong in `forge-core` with a core test.
 - CLI target selection, text output and exit mapping belong in `forge-cli`.
+- MCP schemas, path/concurrency guards and result shaping belong in
+  `forge-cli`; parsing, save semantics and execution stay in `forge-core`.
 - Layout, interaction and transient state belong in `forge-gui`; background
   I/O is routed through `bridge.rs`.
 - A format change requires schema and migration consideration, stable

@@ -60,9 +60,32 @@ struct RunExecution {
 
 /// In-memory project-auth tokens and observed request durations. A GUI bridge
 /// keeps one session for its lifetime; CLI runs keep one per command.
-#[derive(Default)]
 pub struct AuthSession {
     state: tokio::sync::Mutex<AuthSessionState>,
+    allow_project_code: bool,
+}
+
+impl Default for AuthSession {
+    fn default() -> Self {
+        Self {
+            state: tokio::sync::Mutex::default(),
+            allow_project_code: true,
+        }
+    }
+}
+
+impl AuthSession {
+    /// Create an execution session with an explicit project-code trust policy.
+    pub fn with_project_code_allowed(allow_project_code: bool) -> Self {
+        Self {
+            state: tokio::sync::Mutex::default(),
+            allow_project_code,
+        }
+    }
+
+    pub(crate) fn allows_project_code(&self) -> bool {
+        self.allow_project_code
+    }
 }
 
 #[derive(Default)]
@@ -148,7 +171,26 @@ pub fn load_environment(root: &Path, name: Option<&str>) -> Result<Value, Diagno
         Some(name) => {
             let name = super::environment_scope::validate_environment_name(name)
                 .map_err(|message| Diagnostic::new(Code::InvalidAssetInput, message))?;
-            let path = root.join("environments").join(format!("{name}.json"));
+            let directory = root.join("environments");
+            if directory.is_symlink() {
+                return Err(Diagnostic::new(
+                    Code::InvalidAssetInput,
+                    format!(
+                        "refusing to load environments through symbolic link {}",
+                        directory.display()
+                    ),
+                ));
+            }
+            let path = directory.join(format!("{name}.json"));
+            if path.is_symlink() {
+                return Err(Diagnostic::new(
+                    Code::InvalidAssetInput,
+                    format!(
+                        "refusing to load environment through symbolic link {}",
+                        path.display()
+                    ),
+                ));
+            }
             let text = std::fs::read_to_string(&path).map_err(|e| {
                 Diagnostic::new(Code::AssetNotFound, format!("environment {name}: {e}"))
             })?;
@@ -449,10 +491,22 @@ async fn project_auth_header(
     let Some(selected) = select_project_auth(doc, &project, root, request_file)? else {
         return Ok(None);
     };
+    if has_explicit_auth(doc) {
+        return Ok(None);
+    }
     let config = selected.config;
     let provider = checked_project_path(root, &config.request, "auth request")?;
     let provider_doc = super::assertions::load_request_document(&provider)
         .map_err(|message| Diagnostic::new(Code::InvalidAssetInput, message))?;
+    if !auth.allow_project_code && provider_doc.uses_project_code() {
+        return Err(Diagnostic::new(
+            Code::InvalidAssetInput,
+            format!(
+                "auth request {} executes project-owned JavaScript, but project code is disabled",
+                config.request
+            ),
+        ));
+    }
     let canonical_root = root.canonicalize().map_err(|error| {
         Diagnostic::new(
             Code::InvalidAssetInput,
@@ -826,6 +880,16 @@ async fn execute(
     let started = Instant::now();
     if let Some(reason) = skip_reason(doc, &env, secret, &runtime_in) {
         return skipped_execution(doc, reason, started);
+    }
+    if !auth.allow_project_code && doc.uses_project_code() {
+        return failed_execution(
+            doc,
+            Diagnostic::new(
+                Code::InvalidAssetInput,
+                "request executes project-owned JavaScript, but project code is disabled",
+            ),
+            started,
+        );
     }
     let auth_header = match project_auth_header(
         doc,
@@ -1205,6 +1269,22 @@ async fn run_sequence_with_environment_values_impl(
     let mut runtime = empty_object();
     let mut results = Vec::with_capacity(files.len());
     for (position, file) in files.iter().enumerate() {
+        if cancel.is_cancelled() {
+            results.push((
+                RunResult {
+                    request_id: file.display().to_string(),
+                    status: RunStatus::Error,
+                    skip_reason: None,
+                    http: None,
+                    assertions: Vec::new(),
+                    runtime: BTreeMap::new(),
+                    diagnostics: vec![Diagnostic::new(Code::HttpError, "request cancelled")],
+                    duration_ms: 0,
+                },
+                None,
+            ));
+            break;
+        }
         let started = std::time::Instant::now();
         let doc = match super::assertions::load_request_document(file) {
             Ok(d) => d,

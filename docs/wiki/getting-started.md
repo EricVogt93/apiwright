@@ -7,7 +7,7 @@ This guide takes a clean installation to a runnable, file-backed API project. Ap
 Download the package for your platform from the GitHub Releases page (`.AppImage`, `.exe`, or `.dmg`), or run the GUI from source:
 
 ```sh
-cargo run --release -p forge-gui --bin forge-ide
+cargo run --release -p forge-gui --bin apiwright-ide
 ```
 
 Unsigned packages may trigger the operating system's unknown-publisher warning. Release checksums are published with the artifacts.

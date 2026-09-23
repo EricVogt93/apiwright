@@ -26,6 +26,26 @@ jobs:
             libxcursor-dev libxi-dev libxkbcommon-dev libxrandr-dev
       - name: Prepare Rust toolchain
         run: rustup component add rustfmt clippy
+      - name: Check plugin metadata
+        run: |
+          python3 - <<'PY'
+          import json
+          import tomllib
+
+          with open("Cargo.toml", "rb") as file:
+              workspace_version = tomllib.load(file)["workspace"]["package"]["version"]
+          with open("plugins/apiwright/.codex-plugin/plugin.json", encoding="utf-8") as file:
+              plugin_version = json.load(file)["version"]
+          with open(".agents/plugins/marketplace.json", encoding="utf-8") as file:
+              json.load(file)
+
+          if plugin_version != workspace_version:
+              raise SystemExit(
+                  f"plugin version {plugin_version!r} != workspace version {workspace_version!r}"
+              )
+          PY
+      - name: Test plugin binary staging
+        run: python3 -m unittest discover -s plugins/apiwright/scripts -p 'test_*.py'
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked

@@ -677,6 +677,52 @@ fn matrix_binding_must_be_an_array() {
 }
 
 #[tokio::test]
+async fn matrix_project_code_is_blocked_before_binding_resolution() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), "{}").unwrap();
+    let request = root.path().join("requests/matrix.request.json");
+    std::fs::create_dir_all(request.parent().unwrap()).unwrap();
+    let doc = reqv1::RequestDocument::parse(
+        r#"{
+            "formatVersion": 1,
+            "kind": "request",
+            "meta": {"id": "matrix.code", "name": "Matrix code"},
+            "matrix": {
+                "case": {"use": "project:generators/untrusted"}
+            },
+            "request": {"method": "GET", "url": "https://example.test"},
+            "mock": {
+                "status": 200,
+                "headers": [],
+                "body": {"type": "text", "value": "ok"}
+            }
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(&request, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+    let auth = reqv1::AuthSession::with_project_code_allowed(false);
+
+    let error = reqv1::run_matrix_with_responses_in_session(
+        &doc,
+        root.path(),
+        &request,
+        json!({}),
+        &|_| None,
+        &HttpEngine::new(),
+        RunMode::Mock,
+        CancellationToken::new(),
+        &auth,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.0.len(), 1);
+    assert!(error.0[0]
+        .message
+        .contains("project-owned JavaScript, but project code is disabled"));
+}
+
+#[tokio::test]
 async fn js_assets_run_hook_assertions_extractor_and_generator() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1020,6 +1066,93 @@ async fn project_auth_fetcher_reuses_a_live_bearer_token() {
 
     let root = tempfile::tempdir().unwrap();
     let (file, doc) = auth_project(root.path(), &server, 60);
+    let engine = HttpEngine::new();
+    let auth = reqv1::AuthSession::default();
+    for _ in 0..2 {
+        let (result, _) = reqv1::run_with_response_in_session(
+            &doc,
+            root.path(),
+            &file,
+            json!({}),
+            &|_| None,
+            &engine,
+            RunMode::Http,
+            CancellationToken::new(),
+            Value::Null,
+            &auth,
+        )
+        .await;
+        assert_eq!(result.status, RunStatus::Passed, "{:?}", result.diagnostics);
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn project_auth_policy_blocks_code_in_the_loaded_provider_document() {
+    let server = MockServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let (file, doc) = auth_project(root.path(), &server, 60);
+    let provider = root.path().join("requests/auth/token.request.json");
+    std::fs::write(
+        reqv1::hooks_path(&provider),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "kind": "hooks",
+            "hooks": [{
+                "phase": "beforeRequest",
+                "use": "project:hooks/untrusted"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let auth = reqv1::AuthSession::with_project_code_allowed(false);
+
+    let (result, response) = reqv1::run_with_response_in_session(
+        &doc,
+        root.path(),
+        &file,
+        json!({}),
+        &|_| None,
+        &HttpEngine::new(),
+        RunMode::Http,
+        CancellationToken::new(),
+        Value::Null,
+        &auth,
+    )
+    .await;
+
+    assert_eq!(result.status, RunStatus::Error);
+    assert!(response.is_none());
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains(
+            "auth request requests/auth/token.request.json executes project-owned JavaScript"
+        )));
+}
+
+#[tokio::test]
+async fn project_auth_refreshes_before_observed_request_duration_exceeds_ttl() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "token-1"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/me"))
+        .and(header("authorization", "Bearer token-1"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(1_200)))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let (file, doc) = auth_project(root.path(), &server, 2);
     let engine = HttpEngine::new();
     let auth = reqv1::AuthSession::default();
     for _ in 0..2 {
