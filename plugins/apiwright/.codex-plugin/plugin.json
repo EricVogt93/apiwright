@@ -1,6 +1,6 @@
 {
   "name": "apiwright",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Inspect, edit, validate, and run ApiWright API test projects from AI.",
   "author": {
     "name": "Eric Vogt",
