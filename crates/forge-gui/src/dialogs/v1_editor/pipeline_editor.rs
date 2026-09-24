@@ -2,22 +2,15 @@
 
 use super::*;
 
-pub(super) fn assertions_pane(ui: &mut egui::Ui, d: &mut V1EditorState) {
-    let mut add = None;
+pub(super) fn assertions_editor(ui: &mut egui::Ui, d: &mut V1EditorState) {
+    d.ensure_pipeline_row_ids();
+    let snapshot = d.snapshot();
     let mut edit = None;
     ui.horizontal(|ui| {
-        ui.strong(format!("Configured ({})", d.assertions.assertions.len()));
-        ui.menu_button("+ Add assertion", |ui| {
-            for definition in builtin_catalog()
-                .iter()
-                .filter(|definition| definition.intent == BuiltinIntent::Validate)
-            {
-                if ui.button(definition.title).clicked() {
-                    add = Some(*definition);
-                    ui.close();
-                }
-            }
-        });
+        ui.strong(format!("Tests ({})", d.assertions.assertions.len()));
+        if ui.button("+ Add test").clicked() {
+            d.open_catalog(CatalogContext::Assertion);
+        }
     });
     if let Some(file) = d.file.as_deref() {
         ui.weak(format!(
@@ -28,68 +21,89 @@ pub(super) fn assertions_pane(ui: &mut egui::Ui, d: &mut V1EditorState) {
                 .to_string_lossy()
         ));
     }
-    if let Some(definition) = add {
-        match assertion_from_builtin(&definition) {
-            Ok(assertion) => {
-                d.assertions.push(assertion.clone());
-                d.dirty = true;
-                edit = d
-                    .assertions
-                    .assertions
-                    .iter()
-                    .position(|candidate| candidate == &assertion);
-            }
-            Err(error) => d.diagnostics.push(error),
-        }
-    }
-
     let mut remove = None;
+    let mut move_entry = None;
     let mut changed = false;
-    for (index, assertion) in d.assertions.assertions.iter_mut().enumerate() {
+    let assertion_count = d.assertions.assertions.len();
+    for index in 0..assertion_count {
+        let row_id = d.assertion_row_ids[index];
+        let mut assertion = d.assertions.assertions[index].clone();
+        let mut row_changed = false;
         ui.horizontal(|ui| {
-            changed |= ui.checkbox(&mut assertion.enabled, "").changed();
+            row_changed |= ui.checkbox(&mut assertion.enabled, "").changed();
             ui.label(RichText::new(catalog_entry_title(&assertion.uses)).strong());
-            ui.weak(&assertion.uses);
-            if ui.small_button("Edit in catalog").clicked() {
+            if ui
+                .small_button("Replace…")
+                .on_hover_text("Choose a different test asset")
+                .clicked()
+            {
                 edit = Some(index);
+            }
+            if index > 0 && ui.small_button("↑").on_hover_text("Move test up").clicked() {
+                move_entry = Some((index, index - 1));
+            }
+            if index + 1 < assertion_count
+                && ui
+                    .small_button("↓")
+                    .on_hover_text("Move test down")
+                    .clicked()
+            {
+                move_entry = Some((index, index + 1));
             }
             if ui.small_button("Remove").clicked() {
                 remove = Some(index);
             }
         });
-        if !assertion.with.is_empty() {
-            ui.label(
-                RichText::new(serde_json::Value::Object(assertion.with.clone()).to_string())
-                    .monospace()
-                    .small()
-                    .weak(),
-            );
+        egui::CollapsingHeader::new(format!("Parameters · {}", assertion.with.len()))
+            .id_salt(("assertion-with", row_id))
+            .show(ui, |ui| {
+                row_changed |= inline_with_editor(
+                    ui,
+                    row_id,
+                    &mut assertion.with,
+                    &mut d.assertion_with_drafts,
+                );
+            });
+        if row_changed {
+            d.assertions.assertions[index] = assertion;
+            changed = true;
         }
     }
     if let Some(index) = remove {
+        let removed_id = d.assertion_row_ids.remove(index);
         d.assertions.assertions.remove(index);
-        d.editing_assertion = match d.editing_assertion {
-            Some(editing) if editing == index => None,
-            Some(editing) if editing > index => Some(editing - 1),
-            editing => editing,
-        };
+        d.assertion_with_drafts.remove(&removed_id);
+        if d.editing_assertion == Some(removed_id) {
+            d.editing_assertion = None;
+        }
+        changed = true;
+    }
+    if let Some((from, to)) = move_entry {
+        d.assertions.assertions.swap(from, to);
+        d.assertion_row_ids.swap(from, to);
         changed = true;
     }
     if let Some(index) = edit {
         if let Err(error) = begin_assertion_edit(d, index) {
             d.catalog_error = Some(error);
+        } else {
+            d.catalog_open = true;
+            d.catalog_context = CatalogContext::Assertion;
+            d.catalog_intent = Some("Validate".to_string());
+            d.catalog_view = CatalogView::All;
         }
     }
     if changed {
         d.dirty = true;
+        d.record_undo(snapshot);
     }
     if d.assertions.assertions.is_empty() {
-        ui.weak("No assertions configured. Add a built-in here or configure one in the catalog.");
+        ui.weak("No tests yet. Add a check here and configure it before it is saved.");
     }
+}
 
-    ui.add_space(8.0);
-    ui.separator();
-    ui.label(RichText::new("LAST RUN").small().strong().weak());
+pub(super) fn assertion_results(ui: &mut egui::Ui, d: &mut V1EditorState) {
+    ui.label(RichText::new("TEST RESULTS").small().strong().weak());
     let Some(r) = selected_result(d) else {
         ui.weak("Run the request to see assertion results.");
         return;
@@ -119,24 +133,15 @@ pub(super) fn assertions_pane(ui: &mut egui::Ui, d: &mut V1EditorState) {
     }
 }
 
-pub(super) fn hooks_pane(ui: &mut egui::Ui, d: &mut V1EditorState) {
-    let mut add = None;
+pub(super) fn hooks_editor(ui: &mut egui::Ui, d: &mut V1EditorState) {
+    d.ensure_pipeline_row_ids();
+    let snapshot = d.snapshot();
     let mut edit = None;
     ui.horizontal(|ui| {
-        ui.strong(format!("Configured ({})", d.hooks.hooks.len()));
-        ui.menu_button("+ Add hook", |ui| {
-            for definition in builtin_catalog().iter().filter(|definition| {
-                matches!(
-                    definition.intent,
-                    BuiltinIntent::Prepare | BuiltinIntent::Capture
-                ) && matches!(definition.target, BuiltinTarget::Pipeline(_))
-            }) {
-                if ui.button(definition.title).clicked() {
-                    add = Some(*definition);
-                    ui.close();
-                }
-            }
-        });
+        ui.strong(format!("Preparation and capture ({})", d.hooks.hooks.len()));
+        if ui.button("+ Add preparation").clicked() {
+            d.open_catalog(CatalogContext::Hook);
+        }
     });
     if let Some(file) = d.file.as_deref() {
         ui.weak(format!(
@@ -147,101 +152,120 @@ pub(super) fn hooks_pane(ui: &mut egui::Ui, d: &mut V1EditorState) {
                 .to_string_lossy()
         ));
     }
-    if let Some(definition) = add {
-        match hook_from_builtin(&definition) {
-            Ok(hook) => {
-                d.hooks.push(hook.clone());
-                d.dirty = true;
-                edit = d.hooks.hooks.iter().position(|candidate| {
-                    candidate.phase == hook.phase
-                        && candidate.uses == hook.uses
-                        && candidate.with == hook.with
-                        && candidate.enabled == hook.enabled
-                });
-            }
-            Err(error) => d.diagnostics.push(error),
-        }
-    }
-
     let mut remove = None;
+    let mut move_entry = None;
     let mut changed = false;
-    for (index, hook) in d.hooks.hooks.iter_mut().enumerate() {
+    let hook_count = d.hooks.hooks.len();
+    for index in 0..hook_count {
+        let row_id = d.hook_row_ids[index];
+        let mut hook = d.hooks.hooks[index].clone();
+        let mut row_changed = false;
         ui.horizontal(|ui| {
-            changed |= ui.checkbox(&mut hook.enabled, "").changed();
+            row_changed |= ui.checkbox(&mut hook.enabled, "").changed();
             ui.label(RichText::new(catalog_entry_title(&hook.uses)).strong());
             ui.weak(target_label(BuiltinTarget::Pipeline(hook.phase)));
-            ui.weak(&hook.uses);
-            if ui.small_button("Edit in catalog").clicked() {
+            if ui
+                .small_button("Replace…")
+                .on_hover_text("Choose a different preparation or capture asset")
+                .clicked()
+            {
                 edit = Some(index);
+            }
+            if index > 0 && ui.small_button("↑").on_hover_text("Move step up").clicked() {
+                move_entry = Some((index, index - 1));
+            }
+            if index + 1 < hook_count
+                && ui
+                    .small_button("↓")
+                    .on_hover_text("Move step down")
+                    .clicked()
+            {
+                move_entry = Some((index, index + 1));
             }
             if ui.small_button("Remove").clicked() {
                 remove = Some(index);
             }
         });
-        if !hook.with.is_empty() {
-            ui.label(
-                RichText::new(serde_json::Value::Object(hook.with.clone()).to_string())
-                    .monospace()
-                    .small()
-                    .weak(),
-            );
+        egui::CollapsingHeader::new(format!("Parameters · {}", hook.with.len()))
+            .id_salt(("hook-with", row_id))
+            .show(ui, |ui| {
+                row_changed |=
+                    inline_with_editor(ui, row_id, &mut hook.with, &mut d.hook_with_drafts);
+            });
+        if row_changed {
+            d.hooks.hooks[index] = hook;
+            changed = true;
         }
     }
     if let Some(index) = remove {
+        let removed_id = d.hook_row_ids.remove(index);
         d.hooks.hooks.remove(index);
-        d.editing_hook = match d.editing_hook {
-            Some(editing) if editing == index => None,
-            Some(editing) if editing > index => Some(editing - 1),
-            editing => editing,
-        };
+        d.hook_with_drafts.remove(&removed_id);
+        if d.editing_hook == Some(removed_id) {
+            d.editing_hook = None;
+        }
+        changed = true;
+    }
+    if let Some((from, to)) = move_entry {
+        d.hooks.hooks.swap(from, to);
+        d.hook_row_ids.swap(from, to);
         changed = true;
     }
     if let Some(index) = edit {
         if let Err(error) = begin_hook_edit(d, index) {
             d.catalog_error = Some(error);
+        } else {
+            d.catalog_open = true;
+            d.catalog_context = CatalogContext::Hook;
+            d.catalog_intent = None;
+            d.catalog_view = CatalogView::All;
         }
     }
     if changed {
         d.dirty = true;
+        d.record_undo(snapshot);
     }
     if d.hooks.hooks.is_empty() {
         ui.weak("No hooks configured. Add a built-in here or configure one in the catalog.");
     }
 }
 
-pub(super) fn assertion_from_builtin(
-    definition: &BuiltinDefinition,
-) -> Result<AssertionEntry, String> {
-    let with = serde_json::from_str::<serde_json::Value>(definition.example)
-        .map_err(|error| format!("invalid catalog example for {}: {error}", definition.name))?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| format!("catalog example for {} is not an object", definition.name))?;
-    Ok(AssertionEntry {
-        uses: definition.reference.to_string(),
-        with,
-        enabled: true,
-    })
-}
-
-pub(super) fn hook_from_builtin(definition: &BuiltinDefinition) -> Result<PipelineEntry, String> {
-    let BuiltinTarget::Pipeline(phase) = definition.target else {
-        return Err(format!("{} is not a hook", definition.title));
-    };
-    let with = serde_json::from_str::<serde_json::Value>(definition.example)
-        .map_err(|error| format!("invalid catalog example for {}: {error}", definition.name))?
-        .as_object()
-        .cloned()
-        .ok_or_else(|| format!("catalog example for {} is not an object", definition.name))?;
-    Ok(PipelineEntry {
-        phase,
-        uses: definition.reference.to_string(),
-        with,
-        enabled: true,
-    })
+fn inline_with_editor(
+    ui: &mut egui::Ui,
+    row_id: u64,
+    with: &mut serde_json::Map<String, serde_json::Value>,
+    drafts: &mut std::collections::BTreeMap<u64, String>,
+) -> bool {
+    let initial = serde_json::to_string_pretty(&serde_json::Value::Object(with.clone()))
+        .unwrap_or_else(|_| "{}".to_string());
+    let draft = drafts.entry(row_id).or_insert(initial);
+    let response = ui.add(
+        egui::TextEdit::multiline(draft)
+            .code_editor()
+            .desired_rows(4)
+            .desired_width(f32::INFINITY),
+    );
+    match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(draft) {
+        Ok(value) => {
+            if response.changed() && *with != value {
+                *with = value;
+                true
+            } else {
+                false
+            }
+        }
+        Err(error) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Parameters must be a JSON object: {error}"),
+            );
+            response.changed()
+        }
+    }
 }
 
 pub(super) fn begin_assertion_edit(d: &mut V1EditorState, index: usize) -> Result<(), String> {
+    d.ensure_pipeline_row_ids();
     let assertion = d
         .assertions
         .assertions
@@ -267,9 +291,7 @@ pub(super) fn begin_assertion_edit(d: &mut V1EditorState, index: usize) -> Resul
             .as_ref()
             .and_then(|index| {
                 index.assets.iter().find(|asset| {
-                    asset.kind == AssetKind::Assertion
-                        && asset_reference(asset) == assertion.uses
-                        && asset.metadata.is_some()
+                    asset.kind == AssetKind::Assertion && asset_reference(asset) == assertion.uses
                 })
             })
             .cloned()
@@ -277,20 +299,25 @@ pub(super) fn begin_assertion_edit(d: &mut V1EditorState, index: usize) -> Resul
         let parameters = asset
             .metadata
             .as_ref()
-            .ok_or_else(|| format!("no catalog metadata found for {}", assertion.uses))?
-            .parameters
-            .iter()
-            .map(ParameterDefinition::project)
-            .collect::<Vec<_>>();
+            .map(|metadata| {
+                metadata
+                    .parameters
+                    .iter()
+                    .map(ParameterDefinition::project)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         select_project_asset(d, &asset);
+        d.untyped_with_draft = serde_json::Value::Object(assertion.with.clone()).to_string();
         load_catalog_inputs(d, &assertion.with, &parameters);
     }
-    d.editing_assertion = Some(index);
+    d.editing_assertion = d.assertion_row_ids.get(index).copied();
     d.catalog_notice = Some("Editing configured assertion; save it in this form.".to_string());
     Ok(())
 }
 
 pub(super) fn begin_hook_edit(d: &mut V1EditorState, index: usize) -> Result<(), String> {
+    d.ensure_pipeline_row_ids();
     let hook = d
         .hooks
         .hooks
@@ -323,7 +350,6 @@ pub(super) fn begin_hook_edit(d: &mut V1EditorState, index: usize) -> Result<(),
                 index.assets.iter().find(|asset| {
                     matches!(asset.kind, AssetKind::Hook | AssetKind::Extractor)
                         && asset_reference(asset) == hook.uses
-                        && asset.metadata.is_some()
                 })
             })
             .cloned()
@@ -331,15 +357,19 @@ pub(super) fn begin_hook_edit(d: &mut V1EditorState, index: usize) -> Result<(),
         let parameters = asset
             .metadata
             .as_ref()
-            .ok_or_else(|| format!("no catalog metadata found for {}", hook.uses))?
-            .parameters
-            .iter()
-            .map(ParameterDefinition::project)
-            .collect::<Vec<_>>();
+            .map(|metadata| {
+                metadata
+                    .parameters
+                    .iter()
+                    .map(ParameterDefinition::project)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         select_project_asset(d, &asset);
+        d.untyped_with_draft = serde_json::Value::Object(hook.with.clone()).to_string();
         load_catalog_inputs(d, &hook.with, &parameters);
     }
-    d.editing_hook = Some(index);
+    d.editing_hook = d.hook_row_ids.get(index).copied();
     d.catalog_notice = Some("Editing configured hook; save it in this form.".to_string());
     Ok(())
 }

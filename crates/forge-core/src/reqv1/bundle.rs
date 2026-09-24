@@ -17,7 +17,10 @@ use walkdir::{DirEntry, WalkDir};
 use super::model::{Binding, BodySpec, BodyType, MockDef, ProjectConfig, RequestDocument};
 use super::refs::{RefResolver, RefScheme};
 use super::tickets::effective_ticket;
-use super::{assertions_path, effective_environment, effective_openapi, hooks_path, load_project};
+use super::{
+    assertions_path, atomic_write, effective_environment, effective_openapi, hooks_path,
+    load_project,
+};
 
 const BUNDLE_FORMAT: &str = "forge.bundle";
 const BUNDLE_VERSION: u32 = 1;
@@ -112,13 +115,7 @@ pub fn export_bundle(
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
     ensure_no_symlink_components(output)?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)
-        .map_err(|error| format!("cannot create {}: {error}", output.display()))?;
-    file.write_all(rendered.as_bytes())
-        .map_err(|error| format!("cannot write {}: {error}", output.display()))?;
+    atomic_write(output, rendered.as_bytes(), true)?;
     Ok(ExportSummary {
         files: bundle.files.len(),
         requests,

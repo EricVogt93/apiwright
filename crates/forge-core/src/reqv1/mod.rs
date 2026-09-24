@@ -79,7 +79,7 @@ pub use pipeline::{
     run_after_response, run_before_request, AssertionResult, RequestPatch, ResponseView,
 };
 pub use project_files::{
-    delete_project_file, read_project_file, write_project_file, ProjectFileKind,
+    atomic_write, delete_project_file, read_project_file, write_project_file, ProjectFileKind,
     ProjectFileSnapshot,
 };
 pub use refs::{AssetDescriptor, RefResolver, RefScheme};

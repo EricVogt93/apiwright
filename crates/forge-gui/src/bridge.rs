@@ -29,6 +29,9 @@ pub struct V1RunItem {
 
 pub struct V1RunOutput {
     pub items: Vec<V1RunItem>,
+    pub project_root: PathBuf,
+    pub environment: Option<String>,
+    pub mock: bool,
 }
 
 /// A command sent from the UI thread to the bridge thread.
@@ -188,6 +191,8 @@ pub enum Cmd {
 pub enum Evt {
     Run {
         run_id: u64,
+        workspace_root: PathBuf,
+        environment: Option<String>,
         event: RunEvent,
     },
     /// The run could not even start (bad scope, missing environment, ...).
@@ -349,6 +354,8 @@ fn bridge_main(
                     scope,
                     options,
                 } => {
+                    let workspace_root = workspace.root.clone();
+                    let environment = options.environment.clone();
                     let engine = engine.clone();
                     let evt_tx = evt_tx.clone();
                     let ctx = ctx.clone();
@@ -367,7 +374,12 @@ fn bridge_main(
                         let forward_tx = evt_tx.clone();
                         let forward = tokio::spawn(async move {
                             while let Some(event) = rx.recv().await {
-                                let _ = forward_tx.send(Evt::Run { run_id, event });
+                                let _ = forward_tx.send(Evt::Run {
+                                    run_id,
+                                    workspace_root: workspace_root.clone(),
+                                    environment: environment.clone(),
+                                    event,
+                                });
                                 forward_ctx.request_repaint();
                             }
                         });
@@ -948,7 +960,12 @@ async fn run_v1_document(
             .and_then(|body| serde_json::to_vec(body).ok()),
     })
     .collect();
-    Ok(V1RunOutput { items })
+    Ok(V1RunOutput {
+        items,
+        project_root: spec.root.to_path_buf(),
+        environment: spec.env_name.map(str::to_string),
+        mock: spec.mock,
+    })
 }
 
 async fn run_v1_sequence(
@@ -1038,7 +1055,12 @@ async fn run_v1_sequence(
         }
     })
     .collect();
-    Ok(V1RunOutput { items })
+    Ok(V1RunOutput {
+        items,
+        project_root: root.to_path_buf(),
+        environment: env_name.map(str::to_string),
+        mock,
+    })
 }
 
 async fn run_v1_batch(
@@ -1080,7 +1102,12 @@ async fn run_v1_batch(
         .await?;
         items.extend(output.items);
     }
-    Ok(V1RunOutput { items })
+    Ok(V1RunOutput {
+        items,
+        project_root: root.to_path_buf(),
+        environment: env_name.map(str::to_string),
+        mock,
+    })
 }
 
 fn ensure_project_code_allowed(

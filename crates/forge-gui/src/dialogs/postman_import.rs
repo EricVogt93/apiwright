@@ -3,7 +3,11 @@
 //! what will be imported, which scripts will remain quarantined, and which
 //! unsupported features are dropped before writing into the workspace.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    time::Duration,
+};
 
 use egui::Window;
 
@@ -17,6 +21,7 @@ use forge_core::store::{
     save_environment, save_folder_meta, save_secrets, Workspace,
 };
 
+use super::ImportReportParts;
 use crate::state::{AppState, StatusMessage};
 
 /// What the picked file turned out to contain.
@@ -26,18 +31,30 @@ enum Parsed {
     Environment(Environment, SecretValues),
 }
 
+#[derive(Clone)]
+pub(super) struct V1ImportPreview {
+    root: PathBuf,
+    name: String,
+    pub request_count: usize,
+    pub blocked: Vec<String>,
+    pub warnings: Vec<String>,
+    pub has_environment: bool,
+}
+
 /// Transient state of the Postman-import dialog, owned by
 /// [`crate::dialogs::DialogManager`].
 #[derive(Default)]
 pub struct PostmanImportState {
     open: bool,
     parsed: Option<Result<Parsed, String>>,
+    pending_parse: Option<Receiver<Result<Parsed, String>>>,
+    cached_preview: Option<V1ImportPreview>,
     name: String,
 }
 
 impl PostmanImportState {
-    /// Open a file picker for a Postman JSON export and parse it
-    /// immediately. Collection vs environment is auto-detected.
+    /// Open a file picker for a Postman JSON export and parse it in the
+    /// background. Collection vs environment is auto-detected.
     pub fn open(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Postman export", &["json"])
@@ -45,13 +62,21 @@ impl PostmanImportState {
         else {
             return;
         };
-        self.parsed = Some(parse_file(&path));
-        self.name = match &self.parsed {
-            Some(Ok(Parsed::Collection(c))) => c.name.clone(),
-            Some(Ok(Parsed::Environment(e, _))) => e.name.clone(),
-            _ => String::new(),
-        };
+        let (sender, receiver) = mpsc::channel();
+        self.parsed = None;
+        self.pending_parse = Some(receiver);
+        self.cached_preview = None;
+        self.name.clear();
         self.open = true;
+        if let Err(error) = std::thread::Builder::new()
+            .name("apiwright-postman-import".to_string())
+            .spawn(move || {
+                let _ = sender.send(parse_file(&path));
+            })
+        {
+            self.pending_parse = None;
+            self.parsed = Some(Err(error.to_string()));
+        }
     }
 }
 
@@ -69,11 +94,37 @@ fn parse_file(path: &PathBuf) -> Result<Parsed, String> {
     }
 }
 
+pub(super) fn cached_v1_preview(
+    cache: &mut Option<V1ImportPreview>,
+    collection: &ImportedCollection,
+    root: &Path,
+    name: &str,
+) -> V1ImportPreview {
+    if let Some(preview) = cache
+        .as_ref()
+        .filter(|preview| preview.root == root && preview.name == name)
+    {
+        return preview.clone();
+    }
+    let plan = forge_core::reqv1::plan_imported_collection(collection, root, name);
+    let preview = V1ImportPreview {
+        root: root.to_path_buf(),
+        name: name.to_string(),
+        request_count: plan.requests.len(),
+        blocked: plan.blocked,
+        warnings: plan.warnings,
+        has_environment: plan.environment.is_some(),
+    };
+    *cache = Some(preview.clone());
+    preview
+}
+
 /// Render the dialog if open; no-op otherwise.
 pub fn show(ctx: &egui::Context, state: &mut AppState) {
     if !state.dialogs.postman_import.open {
         return;
     }
+    poll_parse(ctx, &mut state.dialogs.postman_import);
     let Some(root) = state
         .workspace
         .as_ref()
@@ -88,6 +139,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     let mut window_open = true;
     let mut import_clicked = false;
     let mut cancel_clicked = false;
+    let mut collection_import_allowed = false;
 
     Window::new("Import Postman")
         .id(egui::Id::new("postman-import-dialog"))
@@ -99,7 +151,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
             let dialog = &mut state.dialogs.postman_import;
             match &dialog.parsed {
                 None => {
-                    ui.weak("No file loaded.");
+                    let message = if dialog.pending_parse.is_some() {
+                        "Parsing selected file…"
+                    } else {
+                        "No file loaded."
+                    };
+                    ui.weak(message);
                 }
                 Some(Err(e)) => {
                     ui.colored_label(ui.visuals().error_fg_color, e);
@@ -117,6 +174,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                         ui.label("Import as:");
                         ui.text_edit_singleline(&mut dialog.name);
                     });
+                    collection_import_allowed = !dialog.name.trim().is_empty();
                     if !import.quarantine.is_empty() {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
@@ -127,19 +185,24 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                         );
                     }
                     if root.join("project.json").is_file() {
-                        let plan = forge_core::reqv1::plan_imported_collection(
+                        let preview = cached_v1_preview(
+                            &mut dialog.cached_preview,
                             import,
                             &root,
                             dialog.name.trim(),
                         );
+                        collection_import_allowed = collection_import_allowed
+                            && (preview.request_count > 0
+                                || preview.has_environment
+                                || !import.quarantine.is_empty());
                         ui.weak(format!(
                             "Request-v1 preview: {} request(s) ready, {} blocked; {} secret variable(s) stay outside committed files.",
-                            plan.requests.len(),
-                            plan.blocked.len(),
+                            preview.request_count,
+                            preview.blocked.len(),
                             import.secret_variables.len()
                         ));
-                        show_blocked(ui, &plan.blocked);
-                        show_warnings(ui, &plan.warnings);
+                        show_blocked(ui, &preview.blocked);
+                        show_warnings(ui, &preview.warnings);
                     }
                     show_skipped(ui, &import.skipped);
                 }
@@ -185,20 +248,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     cancel_clicked = true;
                 }
                 let can_import = match &state.dialogs.postman_import.parsed {
-                    Some(Ok(Parsed::Collection(import)))
-                        if root.join("project.json").is_file() =>
-                    {
-                        let name = state.dialogs.postman_import.name.trim();
-                        let plan = forge_core::reqv1::plan_imported_collection(
-                                import,
-                                &root,
-                                name,
-                            );
-                        !name.is_empty()
-                            && (!plan.requests.is_empty()
-                                || plan.environment.is_some()
-                                || !import.quarantine.is_empty())
-                    }
+                    Some(Ok(Parsed::Collection(_))) => collection_import_allowed,
                     Some(Ok(Parsed::Environment(_, _)))
                         if root.join("project.json").is_file() =>
                     {
@@ -218,6 +268,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
         });
 
     if import_clicked {
+        let report_parts = import_report_parts(&root, &state.dialogs.postman_import);
         let result = state
             .dialogs
             .quarantine
@@ -227,6 +278,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
             Err(e) => state.status = Some(StatusMessage::error(e)),
             Ok(msg) => {
                 state.dialogs.postman_import.open = false;
+                if let Some(report) = report_parts {
+                    state
+                        .dialogs
+                        .import_report
+                        .completed("Postman", msg.clone(), report);
+                }
                 let workspace_reload = reload_workspace(state);
                 let quarantine_reload = state.dialogs.quarantine.reload(&root);
                 state.status = Some(match (workspace_reload, quarantine_reload) {
@@ -241,6 +298,75 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     }
     if cancel_clicked || !window_open {
         state.dialogs.postman_import.open = false;
+        state.dialogs.postman_import.pending_parse = None;
+    }
+}
+
+fn poll_parse(ctx: &egui::Context, dialog: &mut PostmanImportState) {
+    let Some(receiver) = dialog.pending_parse.take() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(parsed) => {
+            dialog.name = match &parsed {
+                Ok(Parsed::Collection(collection)) => collection.name.clone(),
+                Ok(Parsed::Environment(environment, _)) => environment.name.clone(),
+                Err(_) => String::new(),
+            };
+            dialog.parsed = Some(parsed);
+        }
+        Err(TryRecvError::Empty) => {
+            dialog.pending_parse = Some(receiver);
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+        Err(TryRecvError::Disconnected) => {
+            dialog.parsed = Some(Err("Postman import parser stopped unexpectedly".to_string()));
+        }
+    }
+}
+
+fn import_report_parts(root: &Path, dialog: &PostmanImportState) -> Option<ImportReportParts> {
+    match dialog.parsed.as_ref()? {
+        Ok(Parsed::Collection(import)) => {
+            let request_v1 = root.join("project.json").is_file();
+            let plan = request_v1.then(|| {
+                forge_core::reqv1::plan_imported_collection(import, root, dialog.name.trim())
+            });
+            Some(ImportReportParts {
+                created: plan
+                    .as_ref()
+                    .map(|plan| {
+                        plan.requests
+                            .iter()
+                            .map(|request| root.join(&request.path))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                created_count: plan.as_ref().map_or(import.request_count(), |plan| {
+                    plan.requests.len() + usize::from(plan.environment.is_some())
+                }),
+                skipped: import.skipped.clone(),
+                blocked: plan
+                    .as_ref()
+                    .map(|plan| plan.blocked.clone())
+                    .unwrap_or_default(),
+                warnings: plan
+                    .as_ref()
+                    .map(|plan| plan.warnings.clone())
+                    .unwrap_or_default(),
+                quarantined_count: import.quarantine.len(),
+            })
+        }
+        Ok(Parsed::Environment(_, secrets)) => Some(ImportReportParts {
+            created_count: 1,
+            warnings: if secrets.values().any(|value| !value.is_empty()) {
+                vec!["Secret values were stored separately from committed environment data.".into()]
+            } else {
+                Vec::new()
+            },
+            ..ImportReportParts::default()
+        }),
+        Err(_) => None,
     }
 }
 

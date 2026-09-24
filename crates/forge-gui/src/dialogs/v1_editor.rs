@@ -60,6 +60,11 @@ mod tests;
 #[derive(Default)]
 pub struct V1EditorState {
     pub open: bool,
+    /// Inactive request-v1 editor buffers. The active buffer remains in the
+    /// fields below so existing editor actions keep working on one document.
+    tabs: Vec<V1EditorState>,
+    tab_order: Vec<String>,
+    tab_id: Option<String>,
     /// File being edited (its parent's project root is derived).
     file: Option<PathBuf>,
     new_file: bool,
@@ -73,6 +78,11 @@ pub struct V1EditorState {
     validation_due: Option<Instant>,
     assertions: AssertionDocument,
     hooks: HookDocument,
+    assertion_row_ids: Vec<u64>,
+    hook_row_ids: Vec<u64>,
+    next_pipeline_row_id: u64,
+    assertion_with_drafts: BTreeMap<u64, String>,
+    hook_with_drafts: BTreeMap<u64, String>,
     project_auth: Option<ProjectAuthConfig>,
     auth_dirty: bool,
     auth_notice: Option<String>,
@@ -95,7 +105,6 @@ pub struct V1EditorState {
     advisor_config: crate::advisor::AdvisorConfig,
     advisor_question: String,
     advisor_include_response: bool,
-    next_advisor_id: u64,
     active_advisor: Option<u64>,
     advisor_answer: Option<String>,
     advisor_error: Option<String>,
@@ -106,42 +115,142 @@ pub struct V1EditorState {
     catalog_query: String,
     catalog_intent: Option<String>,
     catalog_view: CatalogView,
+    catalog_open: bool,
+    catalog_context: CatalogContext,
     selected_builtin: Option<String>,
     selected_project: Option<String>,
-    editing_assertion: Option<usize>,
-    editing_hook: Option<usize>,
+    editing_assertion: Option<u64>,
+    editing_hook: Option<u64>,
     scroll_to_catalog_form: bool,
     catalog_inputs: BTreeMap<String, ParameterInput>,
+    catalog_drafts: BTreeMap<String, BTreeMap<String, ParameterInput>>,
+    catalog_value_drafts: BTreeMap<(String, String, ParameterSource), String>,
+    untyped_with_draft: String,
+    untyped_with_drafts: BTreeMap<String, String>,
+    body_draft: Option<String>,
+    body_draft_origin: Option<String>,
+    body_draft_error: Option<String>,
+    body_mode_drafts: BTreeMap<String, BodySpec>,
     catalog_error: Option<String>,
     catalog_notice: Option<String>,
     env_name: Option<String>,
     mock: bool,
     allow_project_code: bool,
+    editor_section: EditorSection,
+    request_view: RequestView,
+    close_prompt_open: bool,
+    pending_close_action: Option<PendingEditorAction>,
+    undo_stack: Vec<EditorSnapshot>,
     /// Vertical splitter: fraction of height given to the request (top).
     split_ratio: f32,
     /// Which results pane is shown in the bottom split.
     result_tab: ResultTab,
     response_raw: bool,
     // Run plumbing.
-    next_run_id: u64,
     active_run: Option<u64>,
     in_flight: bool,
     diagnostics: Vec<String>,
     results: Vec<V1RunItem>,
     selected_result: usize,
     last_response: Option<ResponseView>,
-    next_preview_id: u64,
+    last_run_request: Option<String>,
+    last_run_mock: Option<bool>,
+    last_run_environment: Option<String>,
+    last_run_at: Option<Instant>,
     active_preview: Option<u64>,
     preview_in_flight: bool,
     preview: Option<CatalogPreview>,
     preview_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EditorTabInfo {
+    pub id: String,
+    pub title: String,
+    pub dirty: bool,
+    pub running: bool,
+    pub active: bool,
+}
+
+#[derive(Clone)]
+enum PendingEditorAction {
+    Close,
+    SwitchWorkspace,
+    Quit,
+}
+
+impl PendingEditorAction {
+    fn prompt_label(&self) -> &'static str {
+        match self {
+            Self::Close => "close this request",
+            Self::SwitchWorkspace => "switch projects",
+            Self::Quit => "quit ApiWright",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EditorSnapshot {
+    request: String,
+    assertions: AssertionDocument,
+    hooks: HookDocument,
+    assertion_row_ids: Vec<u64>,
+    hook_row_ids: Vec<u64>,
+    assertion_with_drafts: BTreeMap<u64, String>,
+    hook_with_drafts: BTreeMap<u64, String>,
+    body_draft: Option<String>,
+    body_draft_origin: Option<String>,
+    body_draft_error: Option<String>,
+    body_mode_drafts: BTreeMap<String, BodySpec>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum CatalogView {
     #[default]
+    All,
     Builtins,
     Project,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CatalogContext {
+    #[default]
+    General,
+    Assertion,
+    Hook,
+    Body,
+}
+
+impl CatalogContext {
+    fn intent(self) -> Option<&'static str> {
+        match self {
+            Self::General | Self::Body | Self::Hook => None,
+            Self::Assertion => Some("Validate"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "Catalog",
+            Self::Assertion => "Add test",
+            Self::Hook => "Add preparation",
+            Self::Body => "Use data in body",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum EditorSection {
+    #[default]
+    Request,
+    Tests,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RequestView {
+    #[default]
+    Form,
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -205,7 +314,7 @@ impl OpenApiFilter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 enum ParameterSource {
     #[default]
     Literal,
@@ -274,6 +383,7 @@ struct ParameterInput {
 #[derive(Debug, Clone, Copy)]
 enum InsertTarget {
     Binding,
+    Body,
     Assertion,
     Pipeline,
     Mock,
@@ -341,10 +451,8 @@ enum ResultTab {
     #[default]
     Result,
     Assertions,
-    Hooks,
     Auth,
     Runtime,
-    Trace,
     Diagnostics,
 }
 

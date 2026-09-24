@@ -2,6 +2,7 @@
 //! a centered modal overlay with a fuzzy-matched search box over three
 //! sections — open Requests, run Actions and switch Environments.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use egui::{Key, Modal, TextEdit, Ui};
@@ -116,6 +117,10 @@ enum Item {
     Request {
         rel_id: String,
         method: Method,
+        label: String,
+    },
+    V1Request {
+        path: std::path::PathBuf,
         label: String,
     },
     Action {
@@ -260,6 +265,47 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, bridge: &Bridge) {
                 .map(|(_, i)| i)
                 .collect();
         }
+
+        let (v1_requests, v1_environments) = state.dialogs.v1_editor.search_items();
+        request_items.extend(v1_requests.into_iter().filter_map(|(path, label)| {
+            fuzzy_score(&query_lower, &label).map(|_| Item::V1Request { path, label })
+        }));
+        request_items.sort_by_key(|item| {
+            let label = match item {
+                Item::Request { label, .. } | Item::V1Request { label, .. } => label,
+                _ => return std::cmp::Reverse(i32::MIN),
+            };
+            std::cmp::Reverse(fuzzy_score(&query_lower, label).unwrap_or(i32::MIN))
+        });
+        request_items.truncate(MAX_PER_SECTION);
+
+        let mut scored_environments: Vec<(i32, Item)> = env_items
+            .drain(..)
+            .filter_map(|item| match item {
+                Item::Environment { name } => fuzzy_score(&query_lower, &name)
+                    .map(|score| (score, Item::Environment { name })),
+                _ => None,
+            })
+            .collect();
+        let mut environment_names = HashSet::new();
+        for (_, item) in &scored_environments {
+            if let Item::Environment { name } = item {
+                environment_names.insert(name.clone());
+            }
+        }
+        for name in v1_environments {
+            if environment_names.insert(name.clone()) {
+                if let Some(score) = fuzzy_score(&query_lower, &name) {
+                    scored_environments.push((score, Item::Environment { name }));
+                }
+            }
+        }
+        scored_environments.sort_by_key(|item| std::cmp::Reverse(item.0));
+        env_items = scored_environments
+            .into_iter()
+            .take(MAX_PER_SECTION)
+            .map(|(_, item)| item)
+            .collect();
     }
 
     let mut scored: Vec<(i32, Item)> = keymap::ACTIONS
@@ -392,6 +438,15 @@ pub fn show(ctx: &egui::Context, state: &mut AppState, bridge: &Bridge) {
                         state.open_tab(rel_id, def);
                     }
                 }
+                Item::V1Request { path, .. } => {
+                    if let Err(error) = state
+                        .dialogs
+                        .v1_editor
+                        .open_file(path, state.active_env.clone())
+                    {
+                        state.status = Some(crate::state::StatusMessage::error(error));
+                    }
+                }
                 Item::Action { id, .. } => super::dispatch_action(state, bridge, id),
                 Item::Environment { name } => state.active_env = Some(name),
             }
@@ -429,6 +484,12 @@ fn row(ui: &mut Ui, item: &Item, selected: bool) -> bool {
                         .strong()
                         .size(13.0),
                 );
+                if ui.selectable_label(false, label).clicked() {
+                    clicked = true;
+                }
+            }
+            Item::V1Request { label, .. } => {
+                ui.weak("v1");
                 if ui.selectable_label(false, label).clicked() {
                     clicked = true;
                 }

@@ -8,6 +8,7 @@ use forge_core::convert::parse_curl;
 use forge_core::model::{AuthConfig, RequestDef};
 use forge_core::store::{create_request, TreeNode, Workspace};
 
+use super::ImportReportParts;
 use crate::state::{AppState, StatusMessage};
 use crate::widgets::method_badge::method_color;
 
@@ -204,6 +205,19 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 };
                 match result {
                     Ok(file) => {
+                        state.dialogs.import_report.completed(
+                            "curl",
+                            format!("Imported curl request \"{}\".", def.name),
+                            ImportReportParts {
+                                created: if request_v1 {
+                                    vec![file.clone()]
+                                } else {
+                                    Vec::new()
+                                },
+                                created_count: 1,
+                                ..ImportReportParts::default()
+                            },
+                        );
                         if request_v1 {
                             state.assets.load(root.clone());
                             match state.dialogs.v1_editor.open_file(file, None) {

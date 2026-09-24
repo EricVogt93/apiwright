@@ -90,8 +90,8 @@ Every tool requires an absolute `root` pointing at a directory with
 | `delete_request` | Deletes a request and its sidecars after checking sequence and auth references | None |
 | `write_project_file` | Creates or updates an environment, sequence, or asset after a revision check | None |
 | `delete_project_file` | Deletes a resource after protecting selected environments and referenced assets | None |
-| `run_request` | Runs the configured mock by default; `realHttp: true` sends external HTTP | Mock: none; real mode: external |
-| `run_sequence` | Runs the sequence in declared order, using mocks unless `realHttp: true` | Mock: none; real mode: external |
+| `run_request` | Runs the configured mock by default; `realHttp: true` sends external HTTP and records its outcome in project history | Mock: none; real mode: external |
+| `run_sequence` | Runs the sequence in declared order, using mocks unless `realHttp: true`; real HTTP outcomes go to project history | Mock: none; real mode: external |
 
 `write_request` uses the same sidecar split as an IDE save. Pass the `revision`
 from `read_request` as `expectedRevision`; a mismatch is a conflict, not
@@ -126,6 +126,17 @@ sidecars together. `write_project_file` and `delete_project_file` manage environ
 sequence, and asset files; sequence creation should use request paths returned
 by `inspect_project`. Request/resource deletions require the revision from a
 read, and reference checks explain when a request or asset is still in use.
+
+Successful and failed real HTTP runs from either execution tool are written to
+the same `.forge-local/history.sqlite` database used by the IDE. Each matrix
+case and each sequence request is a separate history row, so the IDE and local
+coverage/flaky reports can see MCP runs. Mock runs are deliberately excluded
+from that history and the tool result reports `history.mode: "mock"` with
+`recorded: 0`; they therefore cannot inflate HTTP coverage. MCP history rows
+store outcome metadata only and omit request/response headers and bodies. If
+history cannot be written after a real request has run, the result still
+contains the execution outcome and a `history.error` describing the persistence
+failure.
 
 ## Safe AI workflow
 
@@ -165,7 +176,9 @@ project-relative paths returned by `inspect_project`. A request is a
 `*.request.json` document with optional assertion, hook, environment, OpenAPI,
 and Jira sidecars beside it or inherited from a parent folder. The MCP edits
 these canonical files through `forge-core`, so revisions, validation, and
-execution match the IDE and CLI. It does not create a parallel test database.
+execution match the IDE and CLI. It does not create a parallel test database;
+real MCP executions join the shared IDE history while mock runs remain
+simulation-only.
 
 ## IDE synchronization
 

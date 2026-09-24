@@ -1,4 +1,10 @@
-use std::{process::Stdio, time::Duration};
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    process::Stdio,
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde_json::{json, Value};
 use tokio::{
@@ -35,6 +41,46 @@ async fn response(reader: &mut BufReader<ChildStdout>, id: u64) -> Value {
 
 #[tokio::test]
 async fn binary_manages_a_request_v1_project_over_mcp_stdio() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let http_addr = listener.local_addr().unwrap();
+    let http_server = thread::spawn(move || {
+        for _ in 0..3 {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(accepted) => break accepted,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("local HTTP test server failed to accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(
+                    request.len() < 64 * 1024,
+                    "HTTP request headers are too large"
+                );
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        }
+    });
+
     let project = tempfile::tempdir().unwrap();
     std::fs::write(
         project.path().join("project.json"),
@@ -52,6 +98,15 @@ async fn binary_manages_a_request_v1_project_over_mcp_stdio() {
             "request": {"method": "GET", "url": "https://example.test"},
             "mock": {"status": 200, "headers": [], "body": {"type": "text", "value": "ok"}}
         }"#,
+    )
+    .unwrap();
+    let safe_request_path = requests.join("safe.request.json");
+    let mut safe_document: Value =
+        serde_json::from_slice(&std::fs::read(&safe_request_path).unwrap()).unwrap();
+    safe_document["request"]["url"] = json!(format!("http://{http_addr}/safe"));
+    std::fs::write(
+        &safe_request_path,
+        serde_json::to_vec(&safe_document).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -75,6 +130,15 @@ async fn binary_manages_a_request_v1_project_over_mcp_stdio() {
             "request": {"method": "GET", "url": "https://example.test/second"},
             "mock": {"status": 200, "headers": [], "body": {"type": "text", "value": "ok"}}
         }"#,
+    )
+    .unwrap();
+    let second_request_path = requests.join("second.request.json");
+    let mut second_document: Value =
+        serde_json::from_slice(&std::fs::read(&second_request_path).unwrap()).unwrap();
+    second_document["request"]["url"] = json!(format!("http://{http_addr}/second"));
+    std::fs::write(
+        &second_request_path,
+        serde_json::to_vec(&second_document).unwrap(),
     )
     .unwrap();
     let secret_dir = project.path().join("assets/data");
@@ -228,12 +292,50 @@ async fn binary_manages_a_request_v1_project_over_mcp_stdio() {
     let run = response(&mut stdout, 4).await;
     assert_ne!(run["result"]["isError"], true, "{run}");
     assert_eq!(run["result"]["structuredContent"]["mode"], "mock");
+    assert_eq!(run["result"]["structuredContent"]["history"]["recorded"], 0);
+    assert_eq!(
+        run["result"]["structuredContent"]["history"]["mode"],
+        "mock"
+    );
+    assert!(!project.path().join(".forge-local/history.sqlite").exists());
     assert_eq!(
         run["result"]["structuredContent"]["cases"]
             .as_array()
             .unwrap()
             .len(),
         1
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 18,
+            "method": "tools/call",
+            "params": {
+                "name": "run_request",
+                "arguments": {
+                    "root": project.path(),
+                    "request": "requests/safe.request.json",
+                    "realHttp": true
+                }
+            }
+        }),
+    )
+    .await;
+    let http_run = response(&mut stdout, 18).await;
+    assert_ne!(http_run["result"]["isError"], true, "{http_run}");
+    assert_eq!(
+        http_run["result"]["structuredContent"]["history"]["mode"],
+        "http"
+    );
+    assert_eq!(
+        http_run["result"]["structuredContent"]["history"]["recorded"],
+        1
+    );
+    assert_eq!(
+        http_run["result"]["structuredContent"]["cases"][0]["result"]["http"]["status"],
+        200
     );
 
     send(
@@ -344,12 +446,52 @@ async fn binary_manages_a_request_v1_project_over_mcp_stdio() {
     let sequence_run = response(&mut stdout, 8).await;
     assert_ne!(sequence_run["result"]["isError"], true, "{sequence_run}");
     assert_eq!(
+        sequence_run["result"]["structuredContent"]["history"]["mode"],
+        "mock"
+    );
+    assert_eq!(
+        sequence_run["result"]["structuredContent"]["history"]["recorded"],
+        0
+    );
+    assert_eq!(
         sequence_run["result"]["structuredContent"]["cases"]
             .as_array()
             .unwrap()
             .len(),
         2
     );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 19,
+            "method": "tools/call",
+            "params": {
+                "name": "run_sequence",
+                "arguments": {
+                    "root": project.path(),
+                    "sequence": "sequences/smoke.sequence.json",
+                    "realHttp": true
+                }
+            }
+        }),
+    )
+    .await;
+    let http_sequence_run = response(&mut stdout, 19).await;
+    assert_ne!(
+        http_sequence_run["result"]["isError"], true,
+        "{http_sequence_run}"
+    );
+    assert_eq!(
+        http_sequence_run["result"]["structuredContent"]["history"]["mode"],
+        "http"
+    );
+    assert_eq!(
+        http_sequence_run["result"]["structuredContent"]["history"]["recorded"],
+        2
+    );
+    http_server.join().unwrap();
 
     send(
         &mut stdin,
@@ -557,4 +699,28 @@ async fn binary_manages_a_request_v1_project_over_mcp_stdio() {
         .expect("MCP server did not stop after stdin closed")
         .unwrap();
     assert!(status.success(), "MCP server exited with {status}");
+
+    let history = forge_core::history::HistoryStore::open(
+        &project.path().join(".forge-local/history.sqlite"),
+    )
+    .unwrap();
+    assert_eq!(history.count().unwrap(), 3);
+    let rows = history
+        .list(&forge_core::history::HistoryFilter::default())
+        .unwrap();
+    let mut request_ids = rows
+        .iter()
+        .map(|row| row.request_id.as_str())
+        .collect::<Vec<_>>();
+    request_ids.sort_unstable();
+    assert_eq!(request_ids, ["safe", "safe", "second"]);
+    for row in rows {
+        assert_eq!(row.status, Some(200));
+        assert_eq!(row.passed, Some(true));
+        let entry = history.get(row.id).unwrap().unwrap();
+        assert!(entry.request_headers.is_empty());
+        assert!(entry.request_body.is_none());
+        assert!(entry.response_headers.is_empty());
+        assert!(entry.response_body.is_none());
+    }
 }

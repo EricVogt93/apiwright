@@ -2,7 +2,12 @@
 //! operations to bring in, and generate a whole collection — requests,
 //! optional contract-test assertions and the spec-to-collection binding.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, TryRecvError},
+    time::Duration,
+};
 
 use egui::{RichText, Window};
 
@@ -13,6 +18,7 @@ use forge_core::store::{
     create_collection, create_request, save_collection_meta, Workspace, SPECS_DIR,
 };
 
+use super::ImportReportParts;
 use crate::state::{AppState, StatusMessage};
 use crate::widgets::method_badge::method_color;
 
@@ -23,6 +29,7 @@ pub struct OpenApiImportState {
     open: bool,
     spec_path: Option<PathBuf>,
     spec: Option<Result<ParsedSpec, String>>,
+    pending_parse: Option<Receiver<Result<ParsedSpec, String>>>,
     collection_name: String,
     generate_contract: bool,
     copy_spec: bool,
@@ -31,8 +38,8 @@ pub struct OpenApiImportState {
 }
 
 impl OpenApiImportState {
-    /// Open a file picker for a JSON/YAML OpenAPI document and parse it
-    /// immediately so the dialog can show a summary/operations table.
+    /// Open a file picker for a JSON/YAML OpenAPI document and parse it in
+    /// the background so large specifications do not block the UI.
     pub fn open(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("OpenAPI spec", &["json", "yaml", "yml"])
@@ -40,24 +47,30 @@ impl OpenApiImportState {
         else {
             return;
         };
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string());
-        let parsed = text.and_then(|t| parse_spec(&t).map_err(|e| e.to_string()));
-        self.collection_name = match &parsed {
-            Ok(spec) if !spec.title.is_empty() => spec.title.clone(),
-            _ => path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-        };
-        self.selected = match &parsed {
-            Ok(spec) => vec![true; spec.operations.len()],
-            Err(_) => Vec::new(),
-        };
-        self.spec_path = Some(path);
-        self.spec = Some(parsed);
+        self.collection_name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.selected.clear();
+        self.spec_path = Some(path.clone());
+        self.spec = None;
         self.generate_contract = true;
         self.copy_spec = true;
         self.open = true;
+        let (sender, receiver) = mpsc::channel();
+        self.pending_parse = Some(receiver);
+        if let Err(error) = std::thread::Builder::new()
+            .name("apiwright-openapi-import".to_string())
+            .spawn(move || {
+                let parsed = std::fs::read_to_string(&path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|text| parse_spec(&text).map_err(|error| error.to_string()));
+                let _ = sender.send(parsed);
+            })
+        {
+            self.pending_parse = None;
+            self.spec = Some(Err(error.to_string()));
+        }
     }
 }
 
@@ -66,6 +79,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     if !state.dialogs.openapi_import.open {
         return;
     }
+    poll_parse(ctx, &mut state.dialogs.openapi_import);
     let workspace = state.workspace.clone();
     let Some(root) = workspace
         .as_ref()
@@ -91,7 +105,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
             let dialog = &mut state.dialogs.openapi_import;
             match &dialog.spec {
                 None => {
-                    ui.weak("No spec loaded.");
+                    let message = if dialog.pending_parse.is_some() {
+                        "Reading and parsing specification…"
+                    } else {
+                        "No spec loaded."
+                    };
+                    ui.weak(message);
                 }
                 Some(Err(e)) => {
                     ui.colored_label(ui.visuals().error_fg_color, e);
@@ -199,17 +218,79 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
         });
 
     if import_clicked {
+        let report_parts = import_report_parts(&root, &state.dialogs.openapi_import);
         if let Err(e) = do_import(&root, &mut state.dialogs.openapi_import) {
             state.status = Some(StatusMessage::error(e));
         } else {
             state.dialogs.openapi_import.open = false;
             reload_workspace(state);
-            state.status = Some(StatusMessage::info("OpenAPI spec imported"));
+            let summary = report_parts
+                .as_ref()
+                .map(|report| format!("Imported {} OpenAPI request(s).", report.created_count))
+                .unwrap_or_else(|| "OpenAPI spec imported".to_string());
+            if let Some(report) = report_parts {
+                state
+                    .dialogs
+                    .import_report
+                    .completed("OpenAPI", summary.clone(), report);
+            }
+            state.status = Some(StatusMessage::info(summary));
         }
     }
     if cancel_clicked || !window_open {
         state.dialogs.openapi_import.open = false;
+        state.dialogs.openapi_import.pending_parse = None;
     }
+}
+
+fn poll_parse(ctx: &egui::Context, dialog: &mut OpenApiImportState) {
+    let Some(receiver) = dialog.pending_parse.take() else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(parsed) => {
+            if let Ok(spec) = &parsed {
+                if !spec.title.is_empty() {
+                    dialog.collection_name = spec.title.clone();
+                }
+                dialog.selected = vec![true; spec.operations.len()];
+            }
+            dialog.spec = Some(parsed);
+        }
+        Err(TryRecvError::Empty) => {
+            dialog.pending_parse = Some(receiver);
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+        Err(TryRecvError::Disconnected) => {
+            dialog.spec = Some(Err("OpenAPI parser stopped unexpectedly".to_string()));
+        }
+    }
+}
+
+fn import_report_parts(root: &Path, dialog: &OpenApiImportState) -> Option<ImportReportParts> {
+    let spec = dialog.spec.as_ref()?.as_ref().ok()?;
+    let selected = spec
+        .operations
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| dialog.selected.get(*index).copied().unwrap_or(false));
+    let count = selected.clone().count();
+    if !root.join("project.json").is_file() {
+        return Some(ImportReportParts {
+            created_count: count,
+            ..ImportReportParts::default()
+        });
+    }
+    let target = collection_target(&root.join("requests"), &dialog.collection_name);
+    let created = plan_request_paths(&target, &spec.operations, &dialog.selected)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
+    Some(ImportReportParts {
+        created,
+        created_count: count,
+        ..ImportReportParts::default()
+    })
 }
 
 fn do_import(root: &Path, dialog: &mut OpenApiImportState) -> Result<(), String> {
@@ -309,22 +390,14 @@ fn import_request_v1(
     if !canonical_requests.starts_with(&canonical_root) {
         return Err("requests directory resolves outside the project".to_string());
     }
-    let base = slug(&dialog.collection_name);
-    let base = if base.is_empty() { "openapi" } else { &base };
-    let mut target = canonical_requests.join(base);
-    let mut suffix = 2;
-    while target.exists() {
-        target = requests.join(format!("{base}-{suffix}"));
-        suffix += 1;
-    }
+    let target = collection_target(&canonical_requests, &dialog.collection_name);
     std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+    let planned_paths = plan_request_paths(&target, &spec.operations, &dialog.selected);
 
     let result = (|| {
         forge_core::reqv1::set_openapi(&target, spec_rel_path)?;
-        for (index, operation) in spec.operations.iter().enumerate() {
-            if !dialog.selected.get(index).copied().unwrap_or(false) {
-                continue;
-            }
+        for (index, file) in planned_paths {
+            let operation = &spec.operations[index];
             let mut definition = operation_to_request(operation);
             if definition.auth.is_inherit() {
                 definition.auth = forge_core::model::AuthConfig::None;
@@ -352,7 +425,6 @@ fn import_request_v1(
             };
             let document = forge_core::reqv1::migrate_request(&definition, &id)
                 .map_err(|error| format!("cannot import operation {}: {error}", operation.id))?;
-            let file = forge_core::reqv1::available_path(&target, &id, ".request.json");
             forge_core::reqv1::save_request_document(
                 &file,
                 document,
@@ -370,6 +442,47 @@ fn import_request_v1(
         return Err(error);
     }
     Ok(())
+}
+
+fn collection_target(requests: &Path, collection_name: &str) -> PathBuf {
+    let base = slug(collection_name);
+    let base = if base.is_empty() { "openapi" } else { &base };
+    let mut target = requests.join(base);
+    let mut suffix = 2;
+    while target.exists() {
+        target = requests.join(format!("{base}-{suffix}"));
+        suffix += 1;
+    }
+    target
+}
+
+fn plan_request_paths(
+    target: &Path,
+    operations: &[forge_core::openapi::SpecOperation],
+    selected: &[bool],
+) -> Vec<(usize, PathBuf)> {
+    let mut reserved = HashSet::new();
+    let mut planned = Vec::new();
+    for (index, operation) in operations.iter().enumerate() {
+        if !selected.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let id = slug(&operation.id);
+        let stem = if id.is_empty() {
+            format!("operation-{}", index + 1)
+        } else {
+            id
+        };
+        let mut path = target.join(format!("{stem}.request.json"));
+        let mut suffix = 2;
+        while path.exists() || reserved.contains(&path) {
+            path = target.join(format!("{stem}-{suffix}.request.json"));
+            suffix += 1;
+        }
+        reserved.insert(path.clone());
+        planned.push((index, path));
+    }
+    planned
 }
 
 fn available_spec_path(directory: &Path, file_name: &str) -> (PathBuf, String) {

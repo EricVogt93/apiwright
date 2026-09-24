@@ -111,8 +111,7 @@ pub(super) fn start_advisor(d: &mut V1EditorState, bridge: &Bridge) {
             return;
         }
     };
-    d.next_advisor_id += 1;
-    let advisor_id = d.next_advisor_id;
+    let advisor_id = crate::state::allocate_global_run_id();
     d.active_advisor = Some(advisor_id);
     d.advisor_answer = None;
     d.advisor_error = None;

@@ -23,7 +23,7 @@ use crate::theme::ThemeKind;
 use crate::widgets::method_badge::method_color;
 
 /// File name of the per-workspace history database, under `.forge-local/`.
-pub const HISTORY_DB_FILE: &str = "history.sqlite";
+pub const HISTORY_DB_FILE: &str = forge_core::history::HISTORY_DB_FILE;
 
 /// Open (creating `.forge-local/` if needed) the history database for a
 /// workspace rooted at `root`.

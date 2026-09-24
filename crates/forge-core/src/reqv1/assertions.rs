@@ -111,20 +111,12 @@ impl AssertionDocument {
                 with: assertion.with.clone(),
                 enabled: assertion.enabled,
             };
-            if !request
-                .pipeline
-                .iter()
-                .any(|existing| same_entry(existing, &entry))
-            {
-                request.pipeline.push(entry);
-            }
+            request.pipeline.push(entry);
         }
     }
 
     pub fn push(&mut self, assertion: AssertionEntry) {
-        if !self.assertions.contains(&assertion) {
-            self.assertions.push(assertion);
-        }
+        self.assertions.push(assertion);
     }
 }
 
@@ -550,16 +542,30 @@ fn is_assertion(entry: &PipelineEntry) -> bool {
         || normalized.contains(":assertions/")
 }
 
-fn same_entry(left: &PipelineEntry, right: &PipelineEntry) -> bool {
-    left.phase == right.phase
-        && left.uses == right.uses
-        && left.with == right.with
-        && left.enabled == right.enabled
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_assertions_can_be_configured_more_than_once() {
+        let assertion = AssertionEntry {
+            uses: "builtin:assert-status@1".to_string(),
+            with: serde_json::Map::from_iter([("expected".to_string(), Value::from(200))]),
+            enabled: true,
+        };
+        let mut assertions = AssertionDocument::default();
+        assertions.push(assertion.clone());
+        assertions.push(assertion);
+
+        let mut request = RequestDocument::parse(
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"test","name":"Test"},"request":{"method":"GET","url":"https://example.test"}}"#,
+        )
+        .expect("valid request document");
+        assertions.apply_to(&mut request);
+
+        assert_eq!(assertions.assertions.len(), 2);
+        assert_eq!(request.pipeline.len(), 2);
+    }
 
     #[test]
     fn derives_sidecar_path_and_moves_only_assertions() {

@@ -1,6 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use forge_core::exec::HttpEngine;
+use forge_core::history::{HistoryRecord, HistoryStore, HISTORY_DB_FILE};
 use forge_core::reqv1::{
     self, AssertionDocument, AssertionEntry, HookDocument, ProjectFileKind, ProjectIndex,
     RequestDocument, RunMode, SequenceDocument,
@@ -13,6 +14,58 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+fn persist_mcp_http_history(root: &Path, records: Vec<HistoryRecord>) -> Value {
+    if records.is_empty() {
+        return json!({"mode": "http", "recorded": 0});
+    }
+
+    let directory = root.join(forge_core::store::LOCAL_DIR);
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        return json!({
+            "mode": "http",
+            "recorded": 0,
+            "error": format!("failed to create {}: {error}", directory.display()),
+        });
+    }
+
+    let store = match HistoryStore::open(&directory.join(HISTORY_DB_FILE)) {
+        Ok(store) => store,
+        Err(error) => {
+            return json!({
+                "mode": "http",
+                "recorded": 0,
+                "error": format!("failed to open execution history: {error}"),
+            });
+        }
+    };
+
+    let mut recorded = 0;
+    for record in records {
+        if let Err(error) = store.record_raw(record) {
+            return json!({
+                "mode": "http",
+                "recorded": recorded,
+                "error": format!("failed to record execution history: {error}"),
+            });
+        }
+        recorded += 1;
+    }
+
+    json!({"mode": "http", "recorded": recorded, "source": "mcp"})
+}
+
+fn mcp_history_result(root: &Path, real_http: bool, records: Vec<HistoryRecord>) -> Value {
+    if real_http {
+        persist_mcp_http_history(root, records)
+    } else {
+        json!({
+            "mode": "mock",
+            "recorded": 0,
+            "reason": "mock_runs_are_not_persisted_to_execution_history",
+        })
+    }
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -812,7 +865,7 @@ impl ApiWrightMcp {
         } else {
             RunMode::Mock
         };
-        let cases = match reqv1::run_matrix_with_responses_in_session(
+        let (cases, history_records) = match reqv1::run_matrix_with_responses_in_session(
             &document,
             &root,
             &request,
@@ -825,10 +878,27 @@ impl ApiWrightMcp {
         )
         .await
         {
-            Ok(cases) => cases
-                .into_iter()
-                .map(|(matrix, result, _response)| json!({"matrix": matrix, "result": result}))
-                .collect::<Vec<_>>(),
+            Ok(cases) => {
+                let history_records = if input.real_http {
+                    cases
+                        .iter()
+                        .map(|(_, result, _)| {
+                            HistoryRecord::from_reqv1_http_run(
+                                &document,
+                                result,
+                                input.environment.clone(),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let cases = cases
+                    .into_iter()
+                    .map(|(matrix, result, _response)| json!({"matrix": matrix, "result": result}))
+                    .collect::<Vec<_>>();
+                (cases, history_records)
+            }
             Err(errors) => {
                 return Ok(CallToolResult::structured_error(json!({
                     "code": "execution_error",
@@ -839,11 +909,13 @@ impl ApiWrightMcp {
                 })));
             }
         };
+        let history = mcp_history_result(&root, input.real_http, history_records);
 
         Ok(CallToolResult::structured(json!({
             "request": relative(&root, &request),
             "mode": if input.real_http { "http" } else { "mock" },
             "cases": cases,
+            "history": history,
             "responseBodyIncluded": false,
         })))
     }
@@ -891,6 +963,10 @@ impl ApiWrightMcp {
                     .map_err(|diagnostic| invalid(diagnostic.message))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let documents = files
+            .iter()
+            .map(|file| reqv1::load_request_document(file).map_err(invalid))
+            .collect::<Result<Vec<_>, _>>()?;
         let engine = HttpEngine::new();
         let secret = super::make_secret_provider(&root);
         let auth = reqv1::AuthSession::with_project_code_allowed(input.allow_project_code);
@@ -911,6 +987,18 @@ impl ApiWrightMcp {
         )
         .await
         .map_err(|diagnostic| invalid(diagnostic.message))?;
+        let history_records = if input.real_http {
+            documents
+                .iter()
+                .zip(&results)
+                .map(|(document, (result, _response))| {
+                    HistoryRecord::from_reqv1_http_run(document, result, input.environment.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let history = mcp_history_result(&root, input.real_http, history_records);
         let cases = files
             .drain(..)
             .zip(results)
@@ -922,6 +1010,7 @@ impl ApiWrightMcp {
             "sequence": input.sequence,
             "mode": if input.real_http { "http" } else { "mock" },
             "cases": cases,
+            "history": history,
             "responseBodyIncluded": false,
         })))
     }

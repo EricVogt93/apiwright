@@ -31,7 +31,7 @@ fn saves_reject_external_changes_and_keep_valid_or_invalid_editor_buffers() {
             external_revision
         );
         assert_eq!(std::fs::read_to_string(sidecar).unwrap(), external);
-        editor.open_file(path.clone(), None).unwrap();
+        editor.reload_current_request(true).unwrap();
         assert!(save_now(&mut editor));
         assert!(!editor.dirty);
         assert!(editor.save_conflict.is_none());
@@ -509,7 +509,7 @@ fn opening_document_clears_stale_run_state() {
 }
 
 #[test]
-fn manual_save_mode_keeps_unsaved_request_when_switching_or_creating() {
+fn manual_save_mode_keeps_unsaved_request_across_tabs_and_creation() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
     let requests = root.path().join("requests");
@@ -526,12 +526,13 @@ fn manual_save_mode_keeps_unsaved_request_when_switching_or_creating() {
     editor.dirty = true;
     let draft = editor.text.clone();
 
-    let error = editor.open_file(next, None).unwrap_err();
-    assert!(error.contains("unsaved edits"));
-    assert_eq!(editor.file.as_ref(), Some(&current));
-    assert_eq!(editor.text, draft);
+    let current_id = editor.tab_id.clone().unwrap();
+    editor.open_file(next, None).unwrap();
+    assert_eq!(editor.open_tabs().len(), 2);
 
     editor.open_new(root.path().to_path_buf(), None);
+    assert_eq!(editor.open_tabs().len(), 3);
+    editor.activate_tab(&current_id);
     assert_eq!(editor.file.as_ref(), Some(&current));
     assert_eq!(editor.text, draft);
     assert!(editor.dirty);
@@ -541,6 +542,45 @@ fn manual_save_mode_keeps_unsaved_request_when_switching_or_creating() {
     assert!(std::fs::read_to_string(current)
         .unwrap()
         .contains("draft.example.test"));
+}
+
+#[test]
+fn unsaved_close_prompt_opens_when_the_request_editor_is_hidden() {
+    let mut editor = V1EditorState {
+        open: false,
+        dirty: true,
+        ..V1EditorState::default()
+    };
+
+    editor.request_close();
+
+    assert!(editor.close_prompt_open);
+    assert!(editor.open);
+}
+
+#[test]
+fn discard_for_workspace_switch_clears_background_and_invalid_drafts() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
+    let requests = root.path().join("requests");
+    std::fs::create_dir_all(&requests).unwrap();
+    let first = requests.join("first.request.json");
+    let second = requests.join("second.request.json");
+    std::fs::write(&first, SKELETON).unwrap();
+    std::fs::write(&second, SKELETON).unwrap();
+
+    let mut editor = V1EditorState::default();
+    editor.open_file(first, None).unwrap();
+    editor.dirty = true;
+    editor.open_file(second, None).unwrap();
+    editor.body_draft = Some("{".to_string());
+    editor.body_draft_error = Some("incomplete JSON".to_string());
+    editor.pending_close_action = Some(PendingEditorAction::SwitchWorkspace);
+
+    editor.discard_pending_editor_changes();
+
+    assert!(!editor.has_unsaved_edits());
+    assert!(editor.tabs.iter().all(|tab| !tab.dirty));
 }
 
 #[test]
@@ -560,6 +600,27 @@ fn new_requests_get_a_derived_collision_free_path() {
 
     save_now(&mut editor);
     assert!(requests.join("new-2.request.json").is_file());
+}
+
+#[test]
+fn new_requests_do_not_reuse_an_unsaved_open_path() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), "{}").unwrap();
+    let mut editor = V1EditorState {
+        auto_save: false,
+        ..V1EditorState::default()
+    };
+
+    editor.open_new(root.path().to_path_buf(), None);
+    let first = editor.active_file().unwrap().to_path_buf();
+    editor.open_new(root.path().to_path_buf(), None);
+    let second = editor.active_file().unwrap().to_path_buf();
+
+    assert_eq!(first.file_name().unwrap(), "new.request.json");
+    assert_eq!(second.file_name().unwrap(), "new-2.request.json");
+    assert_ne!(first, second);
+    assert!(!first.exists() && !second.exists());
+    assert_eq!(editor.tab_paths().len(), 2);
 }
 
 #[test]
@@ -656,7 +717,7 @@ fn assertion_insert_is_saved_beside_the_request() {
 #[test]
 fn configured_assertion_can_be_edited_in_the_catalog() {
     let mut editor = V1EditorState {
-        catalog_view: CatalogView::Project,
+        catalog_view: CatalogView::All,
         ..V1EditorState::default()
     };
     editor.assertions.push(AssertionEntry {
@@ -669,7 +730,7 @@ fn configured_assertion_can_be_edited_in_the_catalog() {
     });
 
     begin_assertion_edit(&mut editor, 0).unwrap();
-    assert_eq!(editor.catalog_view, CatalogView::Builtins);
+    assert_eq!(editor.catalog_view, CatalogView::All);
     assert_eq!(editor.selected_builtin.as_deref(), Some("assert-status"));
     assert_eq!(
         editor.catalog_inputs["expected"].source,
@@ -777,11 +838,16 @@ fn failed_run_opens_diagnostics() {
 
 #[test]
 fn failed_open_keeps_the_current_buffer() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), "{}").unwrap();
+    let source = root.path().join("source.request.json");
+    std::fs::write(&source, SKELETON).unwrap();
     let mut editor = V1EditorState {
-        text: "keep me".to_string(),
-        dirty: true,
         ..V1EditorState::default()
     };
+    editor.open_file(source, None).unwrap();
+    editor.text = "keep me".to_string();
+    editor.dirty = true;
 
     let error = editor
         .open_file(
@@ -790,7 +856,7 @@ fn failed_open_keeps_the_current_buffer() {
         )
         .expect_err("missing file must fail");
 
-    assert!(error.contains("unsaved edits"));
+    assert!(error.contains("failed to read"));
     assert_eq!(editor.text, "keep me");
     assert!(editor.dirty);
 
@@ -834,6 +900,161 @@ fn auth_fetcher_is_saved_centrally_not_in_the_request() {
         forge_core::reqv1::RequestDocument::parse(&std::fs::read_to_string(file).unwrap()).unwrap();
     assert_eq!(request.meta.id, "new.request");
     assert!(!editor.auth_dirty);
+}
+
+#[test]
+fn auth_edits_prompt_on_close_and_remain_project_wide_across_tabs() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
+    let requests = root.path().join("requests");
+    std::fs::create_dir_all(&requests).unwrap();
+    let first = requests.join("first.request.json");
+    let second = requests.join("second.request.json");
+    std::fs::write(&first, SKELETON).unwrap();
+    std::fs::write(&second, SKELETON).unwrap();
+
+    let mut editor = V1EditorState::default();
+    editor.open_file(first.clone(), None).unwrap();
+    editor.open_file(second.clone(), None).unwrap();
+    let second_id = editor.tab_id.clone().unwrap();
+    editor.project_auth = Some(ProjectAuthConfig::for_request(
+        "requests/second.request.json".to_string(),
+    ));
+    editor.project_auth.as_mut().unwrap().lifetime_seconds = 2400;
+    editor.auth_dirty = true;
+    assert!(
+        editor.save(),
+        "saving the auth tab must persist project auth"
+    );
+
+    let first_id = editor
+        .open_tabs()
+        .into_iter()
+        .find(|tab| tab.title == "first.request.json")
+        .unwrap()
+        .id;
+    editor.activate_tab(&first_id);
+    assert_eq!(
+        editor.project_auth.as_ref().unwrap().lifetime_seconds,
+        2400,
+        "the background tab must receive the latest project-wide auth config"
+    );
+    editor.project_auth.as_mut().unwrap().refresh_before_seconds = 120;
+    editor.auth_dirty = true;
+    editor.request_close();
+    assert!(
+        editor.close_prompt_open,
+        "auth-only edits need a close prompt"
+    );
+    editor.pending_close_action = Some(PendingEditorAction::Close);
+    assert!(editor.save_before_pending_action());
+
+    let saved = forge_core::reqv1::load_project(root.path())
+        .unwrap()
+        .auth
+        .unwrap();
+    assert_eq!(saved.lifetime_seconds, 2400);
+    assert_eq!(saved.refresh_before_seconds, 120);
+    assert_eq!(editor.tab_id.as_deref(), Some(first_id.as_str()));
+    assert_ne!(editor.tab_id.as_deref(), Some(second_id.as_str()));
+}
+
+#[test]
+fn closing_a_tab_saves_only_the_current_request() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
+    let first = root.path().join("first.request.json");
+    let second = root.path().join("second.request.json");
+    std::fs::write(&first, SKELETON).unwrap();
+    std::fs::write(&second, SKELETON).unwrap();
+    let mut editor = V1EditorState::default();
+    editor.open_file(first.clone(), None).unwrap();
+    editor.open_file(second.clone(), None).unwrap();
+    let first_id = editor
+        .open_tabs()
+        .into_iter()
+        .find(|tab| tab.title == "first.request.json")
+        .unwrap()
+        .id;
+    editor.activate_tab(&first_id);
+    editor.text = editor
+        .text
+        .replace("example.com", "saved-first.example.test");
+    editor.dirty = true;
+    let background = editor
+        .tabs
+        .iter_mut()
+        .find(|tab| tab.file.as_deref() == Some(second.as_path()))
+        .unwrap();
+    background
+        .assertion_with_drafts
+        .insert(1, "not-json".to_string());
+    editor.pending_close_action = Some(PendingEditorAction::Close);
+
+    assert!(editor.save_before_pending_action());
+    assert!(std::fs::read_to_string(&first)
+        .unwrap()
+        .contains("saved-first.example.test"));
+    assert!(editor
+        .tabs
+        .iter()
+        .find(|tab| tab.file.as_deref() == Some(second.as_path()))
+        .unwrap()
+        .invalid_pipeline_draft()
+        .is_some());
+}
+
+#[test]
+fn save_all_keeps_the_tab_with_failed_draft_selected() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
+    let first = root.path().join("first.request.json");
+    let second = root.path().join("second.request.json");
+    std::fs::write(&first, SKELETON).unwrap();
+    std::fs::write(&second, SKELETON).unwrap();
+    let mut editor = V1EditorState::default();
+    editor.open_file(first, None).unwrap();
+    editor.open_file(second.clone(), None).unwrap();
+    let first_id = editor
+        .open_tabs()
+        .into_iter()
+        .find(|tab| tab.title == "first.request.json")
+        .unwrap()
+        .id;
+    editor.activate_tab(&first_id);
+    editor
+        .tabs
+        .iter_mut()
+        .find(|tab| tab.file.as_deref() == Some(second.as_path()))
+        .unwrap()
+        .assertion_with_drafts
+        .insert(1, "not-json".to_string());
+
+    assert!(!editor.save_all_tabs());
+    assert_eq!(
+        editor.active_tab_path().as_deref(),
+        Some("second.request.json")
+    );
+    assert!(editor.diagnostics.join(" ").contains("test parameters"));
+}
+
+#[test]
+fn newly_created_requests_receive_path_derived_unique_ids() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
+    let mut editor = V1EditorState::default();
+    editor.open_new(root.path().to_path_buf(), None);
+    let first = forge_core::reqv1::RequestDocument::parse(&editor.text).unwrap();
+    editor.open_new_in(
+        root.path().to_path_buf(),
+        root.path().join("requests/checkout"),
+        None,
+    );
+    let second = forge_core::reqv1::RequestDocument::parse(&editor.text).unwrap();
+
+    assert_ne!(first.meta.id, second.meta.id);
+    assert_eq!(first.meta.id, "requests.new");
+    assert_eq!(second.meta.id, "requests.checkout.new");
 }
 
 #[test]

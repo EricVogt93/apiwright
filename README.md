@@ -57,9 +57,9 @@ everyone); the free 60-day commercial trial includes it — see
 | Area | What ApiWright provides |
 | --- | --- |
 | Project view | File-explorer hierarchy, story folders, Git state, branch/worktree actions, inherited Jira links, recursive formatting and export |
-| Request editor | JSON beautification, syntax highlighting, diagnostics, minimap, completion, OpenAPI suggestions, autosave and Zen mode |
+| Request editor | Form and JSON views for the same request, inline query/header/body editing, tests, diagnostics, OpenAPI suggestions and autosave |
 | Response tools | Pretty JSON/XML/HTML, raw view, headers, timing, assertions, runtime variables, diagnostics and trace workspace |
-| Catalog | Built-ins and project assets grouped by intent: Validate, Prepare, Capture, Generate and Simulate |
+| Catalog | Contextual picker for tests, request preparation and project data, with typed parameters and reusable project assets |
 | Assertions | Status, headers, timing, body text/regex, JSONPath value/type/length, cookies, JSON Schema and OpenAPI response validation |
 | Hooks | Request preparation, response processing, extractors, logs, request diffs and runtime-variable changes |
 | Authentication | Basic/Bearer helpers, reusable auth requests, Keycloak/Auth0/Azure presets, expiry-aware refresh before a dependent request |

@@ -3,6 +3,7 @@
 //! Kept free of any `egui`/`eframe` types so it can be unit tested without a
 //! graphics context.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use forge_core::history::HistoryStore;
@@ -23,6 +24,15 @@ use crate::theme::ThemeKind;
 use crate::widgets::response_view::ResponseViewState;
 
 pub const DEFAULT_EDITOR_FONT_SIZE: f32 = 15.0;
+
+static NEXT_GUI_RUN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate an ID shared by legacy, request-v1, sequence and batch runs.
+/// The bridge keeps cancellation state keyed by this value, so independent
+/// editor generations must never issue colliding IDs.
+pub fn allocate_global_run_id() -> u64 {
+    NEXT_GUI_RUN_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UiFont {
@@ -254,7 +264,12 @@ pub struct AppState {
     /// `ForgeApp` to run the full switch flow at the top of the next frame
     /// (history store, cookie load, UI-state restore).
     pub pending_workspace: Option<Workspace>,
-    next_run_id: u64,
+    /// Standalone project selected for opening after unsaved editor changes
+    /// have been resolved.
+    pub pending_api_project: Option<std::path::PathBuf>,
+    /// Whether the selected workspace/project should open a blank request
+    /// after its normal initialization finishes.
+    pub open_request_after_workspace: bool,
 }
 
 impl Default for AppState {
@@ -302,7 +317,8 @@ impl Default for AppState {
             ui_font: UiFont::default(),
             dialogs: DialogManager::default(),
             pending_workspace: None,
-            next_run_id: 0,
+            pending_api_project: None,
+            open_request_after_workspace: false,
         }
     }
 }
@@ -314,8 +330,7 @@ impl AppState {
 
     /// Allocate a fresh, monotonically increasing run id.
     pub fn alloc_run_id(&mut self) -> u64 {
-        self.next_run_id += 1;
-        self.next_run_id
+        allocate_global_run_id()
     }
 
     /// Open a tab for `rel_id`, or focus it if already open (de-duplicated

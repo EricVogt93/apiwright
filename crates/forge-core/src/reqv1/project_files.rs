@@ -434,7 +434,11 @@ fn asset_metadata_path(asset: &Path) -> PathBuf {
     asset.with_file_name(format!("{stem}.meta.json"))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], create_new: bool) -> Result<(), String> {
+/// Write a complete file beside its destination, sync it, and then atomically
+/// publish it. `create_new` prevents replacing a destination that appeared
+/// after it was reviewed; when false, replacement is still atomic so readers
+/// never observe a truncated export.
+pub fn atomic_write(path: &Path, bytes: &[u8], create_new: bool) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

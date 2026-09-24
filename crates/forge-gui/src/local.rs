@@ -30,6 +30,10 @@ pub struct UiState {
     #[serde(default)]
     pub open_tabs: Vec<String>,
     #[serde(default)]
+    pub request_v1_tabs: Vec<String>,
+    #[serde(default)]
+    pub active_request_v1_tab: Option<String>,
+    #[serde(default)]
     pub active_tab: usize,
     #[serde(default)]
     pub active_env: Option<String>,
@@ -68,6 +72,8 @@ fn path_for(root: &Path) -> PathBuf {
 pub fn capture(state: &AppState) -> UiState {
     UiState {
         open_tabs: state.tabs.iter().map(|t| t.rel_id.clone()).collect(),
+        request_v1_tabs: state.dialogs.v1_editor.tab_paths(),
+        active_request_v1_tab: state.dialogs.v1_editor.active_tab_path(),
         active_tab: state.active_tab.unwrap_or(0),
         active_env: state.active_env.clone(),
         theme: state.theme.label().to_string(),
@@ -111,32 +117,41 @@ pub fn load(root: &Path) -> Option<UiState> {
 /// that no longer exists; the theme is set on `state.theme` only (callers
 /// still need `ThemeKind::apply` to push it to the `egui::Context`).
 pub fn apply(state: &mut AppState, snapshot: UiState) {
-    let Some(workspace) = state.workspace.clone() else {
-        return;
-    };
-    for rel_id in &snapshot.open_tabs {
-        if let Some(def) = workspace.find_request(rel_id).map(|n| n.def.clone()) {
-            state.open_tab(rel_id.clone(), def);
-        }
-    }
-    // `snapshot.active_tab` is an index into `snapshot.open_tabs`, but any
-    // request that no longer exists was silently skipped above, so
-    // `state.tabs` can be shorter (and differently ordered relative to
-    // gaps) than `snapshot.open_tabs`. Resolve the *rel_id* the snapshot
-    // meant to focus, then find wherever that rel_id landed in the
-    // restored tabs, instead of reusing the original index.
-    state.active_tab = snapshot
-        .open_tabs
-        .get(snapshot.active_tab)
-        .and_then(|rel_id| state.tab_index_for(rel_id))
-        .or_else(|| {
-            if state.tabs.is_empty() {
-                None
-            } else {
-                Some(state.tabs.len() - 1)
+    let workspace = state.workspace.clone();
+    if let Some(workspace) = workspace.as_ref() {
+        for rel_id in &snapshot.open_tabs {
+            if let Some(def) = workspace.find_request(rel_id).map(|n| n.def.clone()) {
+                state.open_tab(rel_id.clone(), def);
             }
-        });
+        }
+        // Requests that no longer exist were skipped above; resolve the
+        // intended rel_id instead of reusing a stale active-tab index.
+        state.active_tab = snapshot
+            .open_tabs
+            .get(snapshot.active_tab)
+            .and_then(|rel_id| state.tab_index_for(rel_id))
+            .or_else(|| {
+                if state.tabs.is_empty() {
+                    None
+                } else {
+                    Some(state.tabs.len() - 1)
+                }
+            });
+    } else {
+        state.active_tab = None;
+    }
     state.active_env = snapshot.active_env;
+    let request_project_root = workspace
+        .as_ref()
+        .map(|workspace| workspace.root.clone())
+        .or_else(|| state.assets.project_root());
+    if let Some(root) = request_project_root.filter(|root| root.join("project.json").is_file()) {
+        state.dialogs.v1_editor.restore_tabs(
+            &root,
+            &snapshot.request_v1_tabs,
+            snapshot.active_request_v1_tab.as_deref(),
+        );
+    }
     if let Some(kind) = ThemeKind::ALL
         .into_iter()
         .find(|k| k.label() == snapshot.theme)
@@ -313,6 +328,49 @@ mod tests {
         assert_eq!(state.tabs.len(), 2);
         assert_eq!(state.active_tab, Some(1));
         assert_eq!(state.tabs[1].rel_id, rel_c);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pure_api_project_restores_request_editor_tabs() {
+        let dir = std::env::temp_dir().join(format!(
+            "forge-gui-local-v1-restore-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let request_dir = dir.join("requests");
+        std::fs::create_dir_all(&request_dir).expect("create request directory");
+        std::fs::write(dir.join("project.json"), r#"{"formatVersion":1}"#)
+            .expect("write project marker");
+        let request_path = request_dir.join("get.request.json");
+        std::fs::write(
+            &request_path,
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"get","name":"Get"},"request":{"method":"GET","url":"https://example.test"}}"#,
+        )
+        .expect("write request");
+
+        let mut original = AppState::new();
+        original.assets.load(dir.clone());
+        original
+            .dialogs
+            .v1_editor
+            .open_file(request_path.clone(), None)
+            .expect("open request");
+        save(&dir, &original);
+
+        let mut restored = AppState::new();
+        restored.assets.load(dir.clone());
+        let snapshot = load(&dir).expect("saved UI snapshot");
+        apply(&mut restored, snapshot);
+
+        assert!(restored.workspace.is_none());
+        assert_eq!(restored.dialogs.v1_editor.tab_paths().len(), 1);
+        assert_eq!(
+            restored.dialogs.v1_editor.active_file(),
+            Some(request_path.as_path())
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

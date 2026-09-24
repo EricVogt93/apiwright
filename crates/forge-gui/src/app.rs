@@ -20,6 +20,24 @@ use crate::theme::{icons, ThemeKind};
 pub(crate) const LIGHT_WINDOW_ICON_PNG: &[u8] = include_bytes!("../assets/logo-light.png");
 pub(crate) const DARK_WINDOW_ICON_PNG: &[u8] = include_bytes!("../assets/logo-dark.png");
 
+fn persisted_project_root(state: &AppState) -> Option<PathBuf> {
+    state
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.root.clone())
+        .or_else(|| state.assets.project_root())
+}
+
+fn restore_project_ui(ctx: &egui::Context, state: &mut AppState, root: &std::path::Path) -> bool {
+    let Some(snapshot) = local::load(root) else {
+        return false;
+    };
+    local::apply(state, snapshot);
+    state.theme.apply(ctx);
+    crate::dialogs::settings::apply_typography(ctx, state);
+    true
+}
+
 fn window_icon_png(theme: egui::Theme) -> &'static [u8] {
     match theme {
         egui::Theme::Light => LIGHT_WINDOW_ICON_PNG,
@@ -72,7 +90,9 @@ impl ForgeApp {
                         app.state.show_assets = true;
                         app.state.show_collections = false;
                         app.state.show_environment = false;
-                        app.state.dialogs.v1_editor.open_new(path, None);
+                        if !restore_project_ui(&ctx, &mut app.state, &path) {
+                            app.state.dialogs.v1_editor.open_new(path, None);
+                        }
                     } else {
                         app.state.status =
                             Some(StatusMessage::error(format!("{}: {e}", path.display())));
@@ -135,11 +155,7 @@ impl ForgeApp {
         if root.join("project.json").exists() {
             self.state.assets.load(root.clone());
         }
-        if let Some(snapshot) = local::load(&root) {
-            local::apply(&mut self.state, snapshot);
-            self.state.theme.apply(ctx);
-            crate::dialogs::settings::apply_typography(ctx, &self.state);
-        } else if root.join("project.json").exists() {
+        if !restore_project_ui(ctx, &mut self.state, &root) && root.join("project.json").exists() {
             self.state.show_assets = true;
             self.state.show_collections = false;
         }
@@ -148,9 +164,10 @@ impl ForgeApp {
     /// Save the outgoing workspace's UI snapshot (if any was open), then
     /// switch to `ws` and run [`Self::on_workspace_opened`] for it.
     fn switch_workspace(&mut self, ws: Workspace, ctx: &egui::Context) {
-        if let Some(old_root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+        if let Some(old_root) = persisted_project_root(&self.state) {
             local::save(&old_root, &self.state);
         }
+        self.reset_project_execution_state();
         self.state.workspace = Some(ws);
         self.state.tabs.clear();
         self.state.active_tab = None;
@@ -159,18 +176,72 @@ impl ForgeApp {
         self.on_workspace_opened(ctx);
     }
 
+    fn reset_project_execution_state(&mut self) {
+        let mut active_runs = std::collections::HashSet::new();
+        if let Some(run_id) = self.state.run_state.run_id {
+            active_runs.insert(run_id);
+        }
+        active_runs.extend(self.state.tabs.iter().filter_map(|tab| tab.run_id));
+        for run_id in active_runs {
+            if let Err(error) = self.bridge.send(Cmd::Cancel { run_id }) {
+                self.state.log.error("bridge", error);
+            }
+        }
+        for run_id in self.state.dialogs.v1_editor.active_run_ids() {
+            if let Err(error) = self.bridge.send(Cmd::CancelV1 { run_id }) {
+                self.state.log.error("bridge", error);
+            }
+        }
+        self.state.dialogs.v1_editor = Default::default();
+        self.state.run_state = Default::default();
+        self.state.run_log = Default::default();
+        self.state.last_run = None;
+    }
+
     /// Record one finished request execution to the workspace's history
     /// store, if it has one open.
-    fn record_history(&mut self, outcome: &RequestOutcome) {
-        let Some(store) = self.state.history_store.as_ref() else {
-            return;
+    fn record_history(
+        &mut self,
+        workspace_root: &std::path::Path,
+        environment: Option<String>,
+        outcome: &RequestOutcome,
+    ) {
+        let current_root = self
+            .state
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root.as_path());
+        let workspace = if current_root == Some(workspace_root) {
+            self.state.workspace.clone()
+        } else {
+            forge_core::store::Workspace::load(workspace_root).ok()
         };
-        let entry = history::new_entry_from_outcome(
-            self.state.workspace.as_ref(),
-            outcome,
-            self.state.active_env.clone(),
-        );
-        if let Err(error) = store.record(entry) {
+        let make_entry =
+            || history::new_entry_from_outcome(workspace.as_ref(), outcome, environment.clone());
+        let result = if current_root == Some(workspace_root) {
+            if let Some(store) = self.state.history_store.as_ref() {
+                store
+                    .record(make_entry())
+                    .map_err(|error| error.to_string())
+            } else {
+                history::open_store(workspace_root)
+                    .map_err(|error| error.to_string())
+                    .and_then(|store| {
+                        store
+                            .record(make_entry())
+                            .map_err(|error| error.to_string())
+                    })
+            }
+        } else {
+            history::open_store(workspace_root)
+                .map_err(|error| error.to_string())
+                .and_then(|store| {
+                    store
+                        .record(make_entry())
+                        .map_err(|error| error.to_string())
+                })
+        };
+        if let Err(error) = result {
             let error = format!("failed to record history: {error}");
             self.state.log.error("history", error.clone());
             self.state.status = Some(StatusMessage::error(error));
@@ -178,18 +249,43 @@ impl ForgeApp {
     }
 
     fn record_v1_history(&mut self, output: &crate::bridge::V1RunOutput) {
-        let Some(store) = self.state.history_store.as_ref() else {
-            return;
+        let current_root = self
+            .state
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root.clone())
+            .or_else(|| self.state.assets.project_root());
+        let use_active_store = current_root.as_deref() == Some(output.project_root.as_path());
+        let opened_store = if use_active_store && self.state.history_store.is_some() {
+            None
+        } else {
+            match history::open_store(&output.project_root) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    let error = format!("failed to open reqv1 history: {error}");
+                    self.state.log.error("history", error.clone());
+                    self.state.status = Some(StatusMessage::error(error));
+                    return;
+                }
+            }
         };
+        let store = if use_active_store {
+            self.state.history_store.as_ref().or(opened_store.as_ref())
+        } else {
+            opened_store.as_ref()
+        };
+        let Some(store) = store else { return };
         for item in &output.items {
-            let entry = history::record_from_v1(item, self.state.active_env.clone());
+            let entry = history::record_from_v1(item, output.environment.clone());
             if let Err(error) = store.record_raw(entry) {
                 let error = format!("failed to record reqv1 history: {error}");
                 self.state.log.error("history", error.clone());
                 self.state.status = Some(StatusMessage::error(error));
             }
         }
-        self.state.history_ui.loaded = false;
+        if use_active_store {
+            self.state.history_ui.loaded = false;
+        }
     }
 
     /// Keep the parsed OpenAPI spec in sync with the workspace's
@@ -237,7 +333,14 @@ impl ForgeApp {
     fn drain_bridge_events(&mut self) {
         while let Some(evt) = self.bridge.try_recv() {
             match evt {
-                Evt::Run { run_id, event } => self.handle_run_event(run_id, event),
+                Evt::Run {
+                    run_id,
+                    workspace_root,
+                    environment,
+                    event,
+                } => {
+                    self.handle_run_event_from_workspace(run_id, workspace_root, environment, event)
+                }
                 Evt::RunFailed { run_id, error } => {
                     self.clear_run(run_id);
                     self.state.log.error("run", error.clone());
@@ -256,6 +359,17 @@ impl ForgeApp {
                 Evt::V1Run { run_id, result } => {
                     if let Ok(output) = &result {
                         self.record_v1_history(output);
+                        if self
+                            .state
+                            .workspace
+                            .as_ref()
+                            .is_some_and(|workspace| workspace.root == output.project_root)
+                        {
+                            let mode = if output.mock { "mock" } else { "HTTP" };
+                            self.state
+                                .log
+                                .info("run", format!("Request-v1 run finished in {mode} mode"));
+                        }
                     }
                     self.state.dialogs.v1_editor.handle_result(run_id, result)
                 }
@@ -312,14 +426,46 @@ impl ForgeApp {
         }
     }
 
+    #[cfg(test)]
     fn handle_run_event(&mut self, run_id: u64, event: RunEvent) {
+        let workspace_root = self
+            .state
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root.clone())
+            .unwrap_or_default();
+        self.handle_run_event_from_workspace(
+            run_id,
+            workspace_root,
+            self.state.active_env.clone(),
+            event,
+        );
+    }
+
+    fn handle_run_event_from_workspace(
+        &mut self,
+        run_id: u64,
+        workspace_root: std::path::PathBuf,
+        environment: Option<String>,
+        event: RunEvent,
+    ) {
+        if !workspace_root.as_os_str().is_empty() {
+            if let RunEvent::RequestFinished(outcome) = &event {
+                self.record_history(&workspace_root, environment, outcome);
+            }
+        }
+        let active_root = self
+            .state
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.root.as_path());
+        if active_root != Some(workspace_root.as_path()) {
+            return;
+        }
         if matches!(event, RunEvent::RunStarted { .. }) {
             self.state.run_log.start(run_id);
         }
         self.state.run_log.apply(run_id, &event);
-        if let RunEvent::RequestFinished(outcome) = &event {
-            self.record_history(outcome);
-        }
         match event {
             RunEvent::RunStarted { total, .. } => {
                 if self.state.run_state.run_id == Some(run_id) {
@@ -362,9 +508,9 @@ impl ForgeApp {
                 }
                 if let Some(idx) = self.state.tab_index_for(&outcome.id) {
                     let tab = &mut self.state.tabs[idx];
-                    tab.response = Some(*outcome);
-                    tab.response_state.sync(tab.response.as_ref());
                     if tab.run_id == Some(run_id) {
+                        tab.response = Some(*outcome);
+                        tab.response_state.sync(tab.response.as_ref());
                         tab.run_id = None;
                     }
                 }
@@ -443,6 +589,17 @@ impl ForgeApp {
         crate::dialogs::dispatch_action(&mut self.state, &self.bridge, action);
     }
 
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        self.state.pending_workspace = None;
+        self.state.pending_api_project = None;
+        self.state.open_request_after_workspace = false;
+        if self.state.dialogs.v1_editor.has_unsaved_edits() {
+            self.state.dialogs.v1_editor.request_quit(ctx);
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn open_workspace_dialog(&mut self) {
         crate::dialogs::open_workspace(&mut self.state);
     }
@@ -462,17 +619,20 @@ impl ForgeApp {
             )));
             return;
         }
-        if let Some(old_root) = self
-            .state
-            .workspace
-            .as_ref()
-            .map(|workspace| workspace.root.clone())
-        {
+        self.state.pending_workspace = None;
+        self.state.pending_api_project = Some(path);
+        self.state.open_request_after_workspace = true;
+    }
+
+    fn switch_api_project(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if let Some(old_root) = persisted_project_root(&self.state) {
             local::save(&old_root, &self.state);
         }
+        self.reset_project_execution_state();
         self.state.workspace = None;
         self.state.tabs.clear();
         self.state.active_tab = None;
+        self.state.active_env = None;
         self.state.assets.load(path.clone());
         match history::open_store(&path) {
             Ok(store) => {
@@ -493,7 +653,9 @@ impl ForgeApp {
         self.state.show_collections = false;
         self.state.show_environment = false;
         let env = self.state.active_env.clone();
-        self.state.dialogs.v1_editor.open_new(path, env);
+        if !restore_project_ui(ctx, &mut self.state, &path) {
+            self.state.dialogs.v1_editor.open_new(path, env);
+        }
     }
 
     fn run_workspace(&mut self) {
@@ -582,15 +744,14 @@ impl ForgeApp {
                     ui.close();
                 }
                 ui.separator();
-                let has_active = self.state.active_tab.is_some();
+                let has_active = self.state.active_tab.is_some()
+                    || self.state.dialogs.v1_editor.open;
                 if ui
                     .add_enabled(has_active, Self::action_button(ui.ctx(), ActionId::Save))
                     .on_hover_text("Save the active request")
                     .clicked()
                 {
-                    if let Some(idx) = self.state.active_tab {
-                        save_tab(&mut self.state, idx);
-                    }
+                    self.dispatch_action(ActionId::Save);
                     ui.close();
                 }
                 if ui
@@ -645,19 +806,20 @@ impl ForgeApp {
                 }
                 ui.separator();
                 if ui.button("Quit").on_hover_text("Close ApiWright").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.request_quit(ui.ctx());
                 }
             })
             .response
             .on_hover_text("Project, file, import and application actions");
             ui.menu_button("Run", |ui| {
-                let can_send = self.state.active_tab.is_some();
+                let can_send = self.state.active_tab.is_some()
+                    || self.state.dialogs.v1_editor.open;
                 if ui
                     .add_enabled(can_send, Self::action_button(ui.ctx(), ActionId::Send))
                     .on_hover_text("Execute the active request")
                     .clicked()
                 {
-                    request_editor::send_active(&mut self.state, &self.bridge);
+                    self.dispatch_action(ActionId::Send);
                     ui.close();
                 }
                 let can_run = self.state.workspace.is_some();
@@ -878,15 +1040,22 @@ impl ForgeApp {
     }
 
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
-        let mut close_idx: Option<usize> = None;
-        let mut select_idx: Option<usize> = None;
+        enum TabAction {
+            Legacy(usize),
+            RequestV1(String),
+        }
+
+        let mut close_tab: Option<TabAction> = None;
+        let mut select_tab: Option<TabAction> = None;
+        let request_v1_tabs = self.state.dialogs.v1_editor.open_tabs();
         egui::ScrollArea::horizontal()
             .id_salt("tab-bar-scroll")
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let accent = self.state.theme.accent_color();
                     for (i, tab) in self.state.tabs.iter().enumerate() {
-                        let is_active = self.state.active_tab == Some(i);
+                        let is_active =
+                            !self.state.dialogs.v1_editor.open && self.state.active_tab == Some(i);
                         // Relay tab look: the active tab is filled with the
                         // editor background (visually joining the tab to the
                         // editor below) plus a 2px accent underline.
@@ -924,13 +1093,13 @@ impl ForgeApp {
                                         egui::Sense::click(),
                                     );
                                     if click.clicked() {
-                                        select_idx = Some(i);
+                                        select_tab = Some(TabAction::Legacy(i));
                                     }
                                     if click.middle_clicked() {
-                                        close_idx = Some(i);
+                                        close_tab = Some(TabAction::Legacy(i));
                                     }
                                     if ui.small_button(icons::CLOSE).clicked() {
-                                        close_idx = Some(i);
+                                        close_tab = Some(TabAction::Legacy(i));
                                     }
                                 });
                             })
@@ -944,23 +1113,118 @@ impl ForgeApp {
                             ui.painter().rect_filled(underline, 1.0, accent);
                         }
                     }
+                    for tab in &request_v1_tabs {
+                        let is_active = self.state.dialogs.v1_editor.open && tab.active;
+                        let frame = egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .fill(if is_active {
+                                self.state.theme.editor_bg()
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            });
+                        let response = frame
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let body = ui
+                                        .horizontal(|ui| {
+                                            ui.weak("v1");
+                                            let mut title = tab.title.clone();
+                                            if tab.dirty {
+                                                title.push(' ');
+                                                title.push_str(icons::DIRTY);
+                                            }
+                                            if tab.running {
+                                                title.push_str("  ◌");
+                                            }
+                                            ui.label(title);
+                                        })
+                                        .response;
+                                    let click = ui.interact(
+                                        body.rect,
+                                        ui.id().with(("v1-tab-body", &tab.id)),
+                                        egui::Sense::click(),
+                                    );
+                                    if click.clicked() {
+                                        select_tab = Some(TabAction::RequestV1(tab.id.clone()));
+                                    }
+                                    if click.middle_clicked() {
+                                        close_tab = Some(TabAction::RequestV1(tab.id.clone()));
+                                    }
+                                    if tab.running
+                                        && ui
+                                            .small_button(icons::STOP)
+                                            .on_hover_text("Stop this request")
+                                            .clicked()
+                                    {
+                                        if let Some(run_id) =
+                                            self.state.dialogs.v1_editor.run_id_for_tab(&tab.id)
+                                        {
+                                            let _ = self.bridge.send(Cmd::CancelV1 { run_id });
+                                        }
+                                    }
+                                    if ui
+                                        .small_button(icons::CLOSE)
+                                        .on_hover_text(format!("Close {}", tab.title))
+                                        .clicked()
+                                    {
+                                        close_tab = Some(TabAction::RequestV1(tab.id.clone()));
+                                    }
+                                });
+                            })
+                            .response;
+                        if is_active {
+                            let rect = response.rect;
+                            let underline = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 2.0, rect.bottom() - 2.0),
+                                egui::pos2(rect.right() - 2.0, rect.bottom()),
+                            );
+                            ui.painter().rect_filled(underline, 1.0, accent);
+                        }
+                    }
                 });
             });
-        if let Some(i) = select_idx {
+        if let Some(action) = select_tab {
             if self.state.auto_save {
                 if let Some(active) = self.state.active_tab {
-                    if active != i && self.state.tabs.get(active).is_some_and(|tab| tab.dirty) {
+                    let switching_from_legacy = match &action {
+                        TabAction::Legacy(index) => {
+                            self.state.dialogs.v1_editor.open || *index != active
+                        }
+                        TabAction::RequestV1(_) => !self.state.dialogs.v1_editor.open,
+                    };
+                    if self.state.tabs.get(active).is_some_and(|tab| tab.dirty)
+                        && switching_from_legacy
+                    {
                         save_tab(&mut self.state, active);
                     }
                 }
             }
-            self.state.active_tab = Some(i);
-        }
-        if let Some(i) = close_idx {
-            if self.state.auto_save && self.state.tabs.get(i).is_some_and(|tab| tab.dirty) {
-                save_tab(&mut self.state, i);
+            match action {
+                TabAction::Legacy(index) => {
+                    if self.state.auto_save {
+                        self.state.dialogs.v1_editor.save_all_tabs();
+                    }
+                    self.state.dialogs.v1_editor.open = false;
+                    self.state.active_tab = Some(index);
+                }
+                TabAction::RequestV1(id) => {
+                    self.state.dialogs.v1_editor.activate_tab(&id);
+                    self.state.dialogs.v1_editor.open = true;
+                }
             }
-            self.state.close_tab(i);
+        }
+        if let Some(action) = close_tab {
+            match action {
+                TabAction::Legacy(index) => {
+                    if self.state.auto_save
+                        && self.state.tabs.get(index).is_some_and(|tab| tab.dirty)
+                    {
+                        save_tab(&mut self.state, index);
+                    }
+                    self.state.close_tab(index);
+                }
+                TabAction::RequestV1(id) => self.state.dialogs.v1_editor.close_tab(&id),
+            }
         }
     }
 
@@ -1297,11 +1561,31 @@ impl eframe::App for ForgeApp {
                 std::time::Instant::now() + std::time::Duration::from_secs(4 * 60 * 60);
         }
         self.drain_bridge_events();
-        if self.state.pending_workspace.is_some() {
+        let close_requested = ui.ctx().input(|input| input.viewport().close_requested());
+        if close_requested && self.state.dialogs.v1_editor.has_unsaved_edits() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_quit(ui.ctx());
+        }
+        let project_change_pending =
+            self.state.pending_workspace.is_some() || self.state.pending_api_project.is_some();
+        if project_change_pending && self.state.dialogs.v1_editor.has_unsaved_edits() {
+            self.state
+                .dialogs
+                .v1_editor
+                .request_workspace_switch(ui.ctx());
+        } else if project_change_pending {
             match self.state.dialogs.quarantine.save_pending() {
                 Ok(()) => {
+                    let open_request = std::mem::take(&mut self.state.open_request_after_workspace);
                     if let Some(ws) = self.state.pending_workspace.take() {
+                        let root = ws.root.clone();
                         self.switch_workspace(ws, ui.ctx());
+                        if open_request {
+                            self.state.dialogs.v1_editor.open_new(root, None);
+                        }
+                    } else if let Some(path) = self.state.pending_api_project.take() {
+                        self.switch_api_project(path, ui.ctx());
                     }
                 }
                 Err(error) => self.state.status = Some(StatusMessage::error(error)),
@@ -1541,6 +1825,19 @@ impl eframe::App for ForgeApp {
                         });
                     return;
                 }
+                if !has_project && !self.state.dialogs.v1_editor.open {
+                    crate::dialogs::welcome::show(ui, &mut self.state);
+                    return;
+                }
+                let panel_bg = ui.visuals().panel_fill;
+                egui::Frame::NONE
+                    .fill(panel_bg)
+                    .inner_margin(egui::Margin::symmetric(2, 0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        self.tab_bar(ui);
+                    });
+                ui.separator();
                 if self.state.dialogs.v1_editor.open {
                     egui::Frame::NONE
                         .inner_margin(egui::Margin {
@@ -1572,18 +1869,6 @@ impl eframe::App for ForgeApp {
                     });
                     return;
                 }
-                // Tab strip sits on the lighter panel bg (chrome), full-width, so
-                // it reads as a strip above the darker editor content — the
-                // JetBrains/Relay contrast the flat single-bg look was missing.
-                let panel_bg = ui.visuals().panel_fill;
-                egui::Frame::NONE
-                    .fill(panel_bg)
-                    .inner_margin(egui::Margin::symmetric(2, 0))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        self.tab_bar(ui);
-                    });
-                ui.separator();
                 if self.state.active_tab.is_some() {
                     // Relay-consistent 12px horizontal gutter around the editor
                     // content (the tab strip above stays full-bleed).
@@ -1615,7 +1900,7 @@ impl eframe::App for ForgeApp {
     /// `self.bridge` drops right after this returns).
     fn on_exit(&mut self) {
         let _ = self.state.dialogs.quarantine.save_pending();
-        if let Some(root) = self.state.workspace.as_ref().map(|w| w.root.clone()) {
+        if let Some(root) = persisted_project_root(&self.state) {
             local::save(&root, &self.state);
         }
     }
@@ -1743,12 +2028,109 @@ pub(crate) fn save_all(state: &mut AppState) {
     for idx in 0..state.tabs.len() {
         save_tab(state, idx);
     }
+    if state.dialogs.v1_editor.open {
+        state.dialogs.v1_editor.save_all_tabs();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use forge_core::runner::RunSummary;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn switching_api_projects_cancels_running_v1_sequence_and_clears_environment() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        Mock::given(path("/first"))
+            .respond_with(move |_: &wiremock::Request| {
+                notify.notify_one();
+                ResponseTemplate::new(200)
+                    .set_body_string("ok")
+                    .set_delay(Duration::from_secs(30))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(path("/second"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("must not run"))
+            .mount(&server)
+            .await;
+
+        let old_project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            old_project.path().join("project.json"),
+            r#"{"formatVersion":1}"#,
+        )
+        .unwrap();
+        let request = |name: &str| {
+            serde_json::json!({
+                "formatVersion": 1,
+                "kind": "request",
+                "meta": {"id": name, "name": name},
+                "request": {
+                    "method": "GET",
+                    "url": format!("{}/{name}", server.uri()),
+                    "headers": []
+                }
+            })
+        };
+        let first = old_project.path().join("first.request.json");
+        let second = old_project.path().join("second.request.json");
+        std::fs::write(&first, request("first").to_string()).unwrap();
+        std::fs::write(&second, request("second").to_string()).unwrap();
+
+        let new_project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            new_project.path().join("project.json"),
+            r#"{"formatVersion":1}"#,
+        )
+        .unwrap();
+        let context = egui::Context::default();
+        let mut app = ForgeApp::new(context.clone(), None);
+        app.state.active_env = Some("production".to_string());
+        app.state
+            .dialogs
+            .v1_editor
+            .open_file(first.clone(), None)
+            .unwrap();
+        app.state.dialogs.v1_editor.run_sequence(
+            old_project.path().to_path_buf(),
+            vec![first, second],
+            None,
+            &app.bridge,
+        );
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("first request must reach the old project server");
+
+        app.switch_api_project(new_project.path().to_path_buf(), &context);
+        assert_eq!(app.state.active_env, None);
+        assert!(app.state.dialogs.v1_editor.active_run_ids().is_empty());
+
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Evt::V1Run {
+                    result: Err(error), ..
+                }) = app.bridge.try_recv()
+                {
+                    break error;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("project switch must cancel the old sequence");
+        assert!(cancelled.contains("cancelled"), "{cancelled}");
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.path(), "/first");
+    }
 
     #[test]
     fn themed_window_icons_are_distinct_valid_pngs() {
@@ -1778,6 +2160,14 @@ mod tests {
     #[test]
     fn stale_run_events_do_not_corrupt_current_run_state() {
         let mut app = ForgeApp::new(egui::Context::default(), None);
+        let dir = std::env::temp_dir().join(format!(
+            "forge-gui-stale-run-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        Workspace::create(&dir, "Stale run events").expect("create workspace");
+        app.state.workspace = Some(Workspace::load(&dir).expect("load workspace"));
         app.state.run_state = RunState {
             run_id: Some(2),
             total: 5,
@@ -1817,5 +2207,6 @@ mod tests {
             RunEvent::RequestFinished(Box::new(dummy_outcome("req-b"))),
         );
         assert_eq!(app.state.run_state.completed, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

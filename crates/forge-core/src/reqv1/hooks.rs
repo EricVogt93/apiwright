@@ -81,24 +81,12 @@ impl HookDocument {
 
     pub fn apply_to(&self, request: &mut RequestDocument) {
         for hook in &self.hooks {
-            if !request
-                .pipeline
-                .iter()
-                .any(|existing| same_entry(existing, hook))
-            {
-                request.pipeline.push(hook.clone());
-            }
+            request.pipeline.push(hook.clone());
         }
     }
 
     pub fn push(&mut self, hook: PipelineEntry) {
-        if !self
-            .hooks
-            .iter()
-            .any(|existing| same_entry(existing, &hook))
-        {
-            self.hooks.push(hook);
-        }
+        self.hooks.push(hook);
     }
 }
 
@@ -111,17 +99,32 @@ pub fn hooks_path(request: &Path) -> PathBuf {
     request.with_file_name(format!("{stem}.hooks.json"))
 }
 
-fn same_entry(left: &PipelineEntry, right: &PipelineEntry) -> bool {
-    left.phase == right.phase
-        && left.uses == right.uses
-        && left.with == right.with
-        && left.enabled == right.enabled
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::model::PipelinePhase;
     use super::*;
+
+    #[test]
+    fn identical_hooks_can_be_configured_more_than_once() {
+        let hook = PipelineEntry {
+            phase: PipelinePhase::BeforeRequest,
+            uses: "builtin:header@1".to_string(),
+            with: serde_json::Map::from_iter([("name".to_string(), "X-Test".into())]),
+            enabled: true,
+        };
+        let mut hooks = HookDocument::default();
+        hooks.push(hook.clone());
+        hooks.push(hook);
+
+        let mut request = RequestDocument::parse(
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"test","name":"Test"},"request":{"method":"GET","url":"https://example.test"}}"#,
+        )
+        .expect("valid request document");
+        hooks.apply_to(&mut request);
+
+        assert_eq!(hooks.hooks.len(), 2);
+        assert_eq!(request.pipeline.len(), 2);
+    }
 
     #[test]
     fn saved_hook_sidecar_is_loaded_into_the_effective_request() {

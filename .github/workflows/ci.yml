@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -42,6 +44,46 @@ jobs:
           if plugin_version != workspace_version:
               raise SystemExit(
                   f"plugin version {plugin_version!r} != workspace version {workspace_version!r}"
+              )
+          PY
+      - name: Require an application version bump for repository changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import tomllib
+
+          base = os.environ.get("BASE_SHA", "")
+          if not base or set(base) == {"0"}:
+              raise SystemExit(0)
+
+          def version_from(contents):
+              version = tomllib.loads(contents)["workspace"]["package"]["version"]
+              if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+                  raise SystemExit(f"expected a stable SemVer version, got {version!r}")
+              return tuple(map(int, version.split("."))), version
+
+          prior = subprocess.run(
+              ["git", "show", f"{base}:Cargo.toml"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout
+          changed = subprocess.run(
+              ["git", "diff", "--name-only", f"{base}...HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.splitlines()
+          previous_version, previous_text = version_from(prior)
+          current_version, current_text = version_from(open("Cargo.toml", encoding="utf-8").read())
+          if changed and current_version <= previous_version:
+              raise SystemExit(
+                  f"repository changes require a newer workspace version: "
+                  f"base is {previous_text}, current is {current_text}"
               )
           PY
       - name: Test plugin binary staging

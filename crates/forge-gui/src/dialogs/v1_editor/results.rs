@@ -19,6 +19,34 @@ pub(super) fn scale_results_typography(style: &mut egui::Style, editor_font_size
 
 pub(super) fn results_pane(ui: &mut egui::Ui, d: &mut V1EditorState, editor_font_size: f32) {
     scale_results_typography(ui.style_mut(), editor_font_size);
+    if let Some(mode) = d.last_run_mock {
+        let environment = d
+            .last_run_environment
+            .as_deref()
+            .unwrap_or("no environment");
+        let age = d
+            .last_run_at
+            .map(|ran_at| {
+                let seconds = ran_at.elapsed().as_secs();
+                if seconds < 60 {
+                    format!("{seconds}s ago")
+                } else {
+                    format!("{}m ago", seconds / 60)
+                }
+            })
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            let mode = if mode { "Mock" } else { "HTTP" };
+            if d.in_flight {
+                ui.weak(format!("Running: {mode} · {environment}"));
+            } else {
+                ui.weak(format!("Last run: {mode} · {environment} · {age}"));
+            }
+            if run_results_are_stale(d) {
+                ui.colored_label(ui.visuals().warn_fg_color, "Results are out of date");
+            }
+        });
+    }
     if d.results.len() > 1 {
         let mut selected = None;
         ui.horizontal_wrapped(|ui| {
@@ -39,7 +67,7 @@ pub(super) fn results_pane(ui: &mut egui::Ui, d: &mut V1EditorState, editor_font
         }
         ui.separator();
     }
-    // Tab strip with a pass/fail count on the Assertions tab.
+    // Tab strip with a pass/fail count on the Tests tab.
     let (passed, total) = selected_result(d)
         .map(|r| {
             (
@@ -48,15 +76,10 @@ pub(super) fn results_pane(ui: &mut egui::Ui, d: &mut V1EditorState, editor_font
             )
         })
         .unwrap_or((0, 0));
-    let assertions_label = if total > 0 {
-        format!("Assertions ({passed}/{total})")
+    let tests_label = if total > 0 {
+        format!("Tests ({passed}/{total})")
     } else {
-        "Assertions".to_string()
-    };
-    let hooks_label = if d.hooks.hooks.is_empty() {
-        "Hooks".to_string()
-    } else {
-        format!("Hooks ({})", d.hooks.hooks.len())
+        "Tests".to_string()
     };
     let auth_label = if d.project_auth.is_some() {
         "Auth · active"
@@ -73,11 +96,9 @@ pub(super) fn results_pane(ui: &mut egui::Ui, d: &mut V1EditorState, editor_font
         let compact = ui.available_width() < 640.0;
         let tabs = [
             (ResultTab::Result, "Response".to_string()),
-            (ResultTab::Assertions, assertions_label),
-            (ResultTab::Hooks, hooks_label),
+            (ResultTab::Assertions, tests_label),
             (ResultTab::Auth, auth_label.to_string()),
             (ResultTab::Runtime, "Runtime".to_string()),
-            (ResultTab::Trace, "Trace".to_string()),
             (ResultTab::Diagnostics, "Diagnostics".to_string()),
         ];
         for (which, label) in tabs.iter().take(if compact { 4 } else { tabs.len() }) {
@@ -134,23 +155,46 @@ pub(super) fn results_pane(ui: &mut egui::Ui, d: &mut V1EditorState, editor_font
         .auto_shrink([false, false])
         .show(ui, |ui| match d.result_tab {
             ResultTab::Result => result_summary(ui, d),
-            ResultTab::Assertions => assertions_pane(ui, d),
-            ResultTab::Hooks => hooks_pane(ui, d),
+            ResultTab::Assertions => assertion_results(ui, d),
             ResultTab::Auth => auth_pane(ui, d),
             ResultTab::Runtime => runtime_pane(ui, d),
-            ResultTab::Trace => trace_pane(ui),
             ResultTab::Diagnostics => diagnostics_pane(ui, d),
         });
+}
+
+fn run_results_are_stale(d: &V1EditorState) -> bool {
+    if d.body_draft_error.is_some() {
+        return true;
+    }
+    if d.last_run_mock.is_some_and(|mode| mode != d.mock) {
+        return true;
+    }
+    let current_environment = d.env_name.clone().or_else(|| {
+        d.root
+            .as_deref()
+            .zip(d.file.as_deref())
+            .and_then(|(root, file)| {
+                forge_core::reqv1::effective_environment(root, file)
+                    .ok()
+                    .flatten()
+                    .map(|selection| selection.value)
+            })
+    });
+    if current_environment != d.last_run_environment {
+        return true;
+    }
+    let current = effective_document(d)
+        .and_then(|document| serialize_request(&document))
+        .ok();
+    current != d.last_run_request
 }
 
 pub(super) fn result_tab_help(tab: ResultTab) -> &'static str {
     match tab {
         ResultTab::Result => "Formatted response body, headers and status",
-        ResultTab::Assertions => "Assertions configured for this request and their results",
-        ResultTab::Hooks => "Before- and after-request scripts",
+        ResultTab::Assertions => "Pass/fail results from the last run",
         ResultTab::Auth => "Authentication source, refresh policy and token status",
         ResultTab::Runtime => "Execution duration, environment and transport details",
-        ResultTab::Trace => "Request lifecycle trace (coming soon)",
         ResultTab::Diagnostics => "Validation, OpenAPI and execution diagnostics",
     }
 }
@@ -258,18 +302,6 @@ pub(super) fn result_summary(ui: &mut egui::Ui, d: &mut V1EditorState) {
                 false,
             );
         });
-}
-
-pub(super) fn trace_pane(ui: &mut egui::Ui) {
-    ui.allocate_ui_with_layout(
-        ui.available_size(),
-        egui::Layout::centered_and_justified(egui::Direction::TopDown),
-        |ui| {
-            ui.strong("No trace captured").on_hover_text(
-                "Trace will show request phases, hooks, redirects, and network timing.",
-            );
-        },
-    );
 }
 
 pub(super) fn response_is_markup(response: &ResponseView, text: &str) -> bool {

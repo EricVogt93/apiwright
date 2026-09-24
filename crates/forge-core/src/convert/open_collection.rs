@@ -1787,6 +1787,7 @@ fn lower_request(
         pipeline: Vec::new(),
         mock: None,
     };
+    deduplicate_imported_pipeline(&mut assertions, &mut hooks);
     LoweredRequest {
         request,
         assertions,
@@ -1808,6 +1809,33 @@ fn lower_request(
         blocked_auth_scripts: assertion_scripts.blocked_auth,
         quarantine: assertion_scripts.quarantine,
     }
+}
+
+fn deduplicate_imported_pipeline(assertions: &mut AssertionDocument, hooks: &mut HookDocument) {
+    let mut seen_assertions = Vec::new();
+    assertions.assertions.retain(|assertion| {
+        if seen_assertions.contains(assertion) {
+            false
+        } else {
+            seen_assertions.push(assertion.clone());
+            true
+        }
+    });
+
+    let mut seen_hooks: Vec<PipelineEntry> = Vec::new();
+    hooks.hooks.retain(|hook| {
+        if seen_hooks.iter().any(|seen| {
+            seen.phase == hook.phase
+                && seen.uses == hook.uses
+                && seen.with == hook.with
+                && seen.enabled == hook.enabled
+        }) {
+            false
+        } else {
+            seen_hooks.push(hook.clone());
+            true
+        }
+    });
 }
 
 fn lower_body(

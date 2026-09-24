@@ -520,6 +520,7 @@ pub(super) fn save_project_auth(d: &mut V1EditorState) {
         Ok(()) => {
             d.auth_dirty = false;
             d.auth_notice = Some("Project auth saved.".to_string());
+            d.sync_project_auth_to_tabs();
         }
         Err(error) => d.auth_notice = Some(format!("Auth not saved: {error}")),
     }

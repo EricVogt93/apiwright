@@ -600,8 +600,10 @@ mod tests {
     fn editor_font_size_does_not_change_generic_monospace_text() {
         let ctx = egui::Context::default();
         let before = ctx.style_of(egui::Theme::Dark).text_styles[&egui::TextStyle::Monospace].size;
-        let mut state = AppState::default();
-        state.editor_font_size = 22.0;
+        let state = AppState {
+            editor_font_size: 22.0,
+            ..AppState::default()
+        };
 
         apply_typography(&ctx, &state);
 

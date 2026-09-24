@@ -1330,12 +1330,18 @@ fn export_path(state: &mut AppState, source: &Path, format: BundleFormat) {
     };
     match forge_core::reqv1::export_bundle(&root, source, format, &output) {
         Ok(summary) => {
-            state.status = Some(StatusMessage::info(format!(
+            let message = format!(
                 "Exported {} request(s) and {} file(s) to {}",
                 summary.requests,
                 summary.files,
                 summary.output.display()
-            )));
+            );
+            state.dialogs.export_review.completed(
+                "ApiWright bundle",
+                message.clone(),
+                summary.output.clone(),
+            );
+            state.status = Some(StatusMessage::info(message));
         }
         Err(error) => state.status = Some(StatusMessage::error(error)),
     }
@@ -1346,8 +1352,6 @@ fn export_interchange_path(
     source: &Path,
     format: forge_core::reqv1::InterchangeFormat,
 ) {
-    use std::io::Write as _;
-
     let Some(root) = state.assets.root.clone() else {
         return;
     };
@@ -1426,30 +1430,19 @@ fn export_interchange_path(
     let Some(output) = output else {
         return;
     };
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output)
-            .map_err(|error| format!("cannot create {}: {error}", output.display()))?;
-        file.write_all(export.content.as_bytes())
-            .map_err(|error| format!("cannot write {}: {error}", output.display()))
-    })();
-    match result {
-        Ok(()) => {
-            let loss_report = if export.warnings.is_empty() {
-                "No known request features were omitted.".to_string()
-            } else {
-                format!("Loss report: {}", export.warnings.join("; "))
-            };
-            state.status = Some(StatusMessage::info(format!(
-                "Exported {}. {}",
-                output.display(),
-                loss_report
-            )));
-        }
-        Err(error) => state.status = Some(StatusMessage::error(error)),
-    }
+    let (title, filter) = match format {
+        forge_core::reqv1::InterchangeFormat::Postman => ("Postman", "Postman collection JSON"),
+        forge_core::reqv1::InterchangeFormat::Bruno => ("Bruno", "Bruno request"),
+    };
+    let extension = format.extension().rsplit('.').next().unwrap_or("json");
+    state.dialogs.export_review.prepare(
+        title,
+        output,
+        export.content,
+        export.warnings,
+        filter,
+        extension,
+    );
 }
 
 fn import_into(state: &mut AppState, destination: &Path) {
