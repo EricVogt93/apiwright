@@ -189,6 +189,8 @@ fn open_recent(state: &mut AppState, path: &Path) {
     match Workspace::load(path) {
         Ok(ws) => {
             state.pending_workspace = Some(ws);
+            state.pending_api_project = None;
+            state.open_request_after_workspace = false;
             state.status = Some(StatusMessage::info(format!("Opened {}", path.display())));
             remember_recent(path);
         }

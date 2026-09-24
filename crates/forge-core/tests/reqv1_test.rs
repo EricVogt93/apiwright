@@ -290,6 +290,109 @@ fn unknown_alias_is_reported() {
 }
 
 #[test]
+fn resolves_multipart_binary_and_transport_settings_from_project_files() {
+    let root = tempfile::tempdir().unwrap();
+    let requests = root.path().join("requests");
+    let assets = root.path().join("assets");
+    std::fs::create_dir_all(&requests).unwrap();
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("upload.txt"), b"file payload").unwrap();
+    std::fs::write(assets.join("payload.bin"), [0_u8, 1, 2, 255]).unwrap();
+    let request_file = requests.join("body.request.json");
+
+    let multipart = reqv1::RequestDocument::parse(
+        r#"{"formatVersion":1,"kind":"request","meta":{"id":"multipart","name":"multipart"},
+            "request":{"method":"POST","url":"https://example.test/upload","settings":{
+            "timeoutMs":0,"followRedirects":false,"maxRedirects":3,"encodeUrl":false},
+            "body":{"type":"multipart","parts":[
+            {"type":"text","name":"note","value":"hello ${env.name}","contentType":"text/plain"},
+            {"type":"file","name":"upload","file":"../assets/upload.txt","filename":"sent.txt"},
+            {"type":"text","name":"disabled","value":"no","enabled":false}]}}}"#,
+    )
+    .unwrap();
+    let ir = reqv1::validate(
+        &multipart,
+        root.path(),
+        &request_file,
+        json!({"name": "world"}),
+        &secret,
+    )
+    .unwrap();
+    assert_eq!(ir.timeout, None);
+    assert!(!ir.follow_redirects);
+    assert_eq!(ir.max_redirects, 3);
+    assert!(!ir.encode_url);
+    let reqv1::ResolvedBody::Multipart(parts) = ir.body else {
+        panic!("multipart body")
+    };
+    assert_eq!(parts.len(), 2);
+    assert!(matches!(
+        &parts[0].data,
+        reqv1::ir::ResolvedMultipartData::Text(value) if value == "hello world"
+    ));
+    assert!(matches!(
+        &parts[1].data,
+        reqv1::ir::ResolvedMultipartData::File(path) if path == &assets.join("upload.txt")
+    ));
+    assert_eq!(parts[1].filename.as_deref(), Some("sent.txt"));
+
+    let binary = reqv1::RequestDocument::parse(
+        r#"{"formatVersion":1,"kind":"request","meta":{"id":"binary","name":"binary"},
+            "request":{"method":"POST","url":"https://example.test/upload","body":{
+            "type":"binary","file":"../assets/payload.bin","contentType":"application/x-test"}}}"#,
+    )
+    .unwrap();
+    let ir = reqv1::validate(&binary, root.path(), &request_file, json!({}), &secret).unwrap();
+    let reqv1::ResolvedBody::Binary { content_type, data } = ir.body else {
+        panic!("binary body")
+    };
+    assert_eq!(content_type.as_deref(), Some("application/x-test"));
+    assert_eq!(data, [0_u8, 1, 2, 255]);
+    assert_eq!(ir.timeout, Some(std::time::Duration::from_secs(30)));
+}
+
+#[test]
+fn body_files_reject_missing_and_symlink_escape_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let requests = root.path().join("requests");
+    let assets = root.path().join("assets");
+    std::fs::create_dir_all(&requests).unwrap();
+    std::fs::create_dir_all(&assets).unwrap();
+    let request_file = requests.join("body.request.json");
+
+    let missing = reqv1::RequestDocument::parse(
+        r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+            "request":{"method":"POST","url":"http://x","body":{"type":"binary",
+            "file":"../assets/missing.bin"}}}"#,
+    )
+    .unwrap();
+    let errors =
+        reqv1::validate(&missing, root.path(), &request_file, json!({}), &secret).unwrap_err();
+    assert!(errors.iter().any(|error| error.code == "ASSET_NOT_FOUND"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        std::fs::write(outside.path().join("outside.bin"), b"outside").unwrap();
+        symlink(
+            outside.path().join("outside.bin"),
+            assets.join("escape.bin"),
+        )
+        .unwrap();
+        let escape = reqv1::RequestDocument::parse(
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+                "request":{"method":"POST","url":"http://x","body":{"type":"binary",
+                "file":"../assets/escape.bin"}}}"#,
+        )
+        .unwrap();
+        let errors =
+            reqv1::validate(&escape, root.path(), &request_file, json!({}), &secret).unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "PATH_ESCAPE"));
+    }
+}
+
+#[test]
 fn schema_json_matches_the_shipped_schema() {
     // The fixture copy and the source schema must not drift.
     let shipped = std::fs::read_to_string(
@@ -305,6 +408,201 @@ fn schema_json_matches_the_shipped_schema() {
         shipped, fixture,
         "fixture schema drifted from schemas/request-v1.schema.json"
     );
+    let schema: Value = serde_json::from_str(&shipped).unwrap();
+    let typed = json!({
+        "formatVersion": 1,
+        "kind": "request",
+        "meta": {"id": "upload", "name": "Upload"},
+        "execution": {
+            "delayBeforeMs": 5000,
+            "skip": {"reason": "optional", "when": {"not": {
+                "var": {"scope": "env", "name": "enabled"}
+            }}}
+        },
+        "request": {
+            "method": "POST",
+            "url": "https://example.test/upload",
+            "settings": {"timeoutMs": 0, "encodeUrl": false},
+            "body": {"type": "multipart", "parts": [
+                {"type": "text", "name": "note", "value": "hello"},
+                {"type": "file", "name": "upload", "file": "../assets/a.bin"}
+            ]}
+        }
+    });
+    assert!(jsonschema::is_valid(&schema, &typed));
+    let magic = json!({
+        "formatVersion": 1,
+        "kind": "request",
+        "meta": {"id": "upload", "name": "Upload"},
+        "request": {
+            "method": "POST",
+            "url": "https://example.test/upload",
+            "body": {"type": "binary", "value": "a.bin"}
+        }
+    });
+    assert!(!jsonschema::is_valid(&schema, &magic));
+
+    let mut negative_delay = typed.clone();
+    negative_delay["execution"]["delayBeforeMs"] = json!(-1);
+    assert!(!jsonschema::is_valid(&schema, &negative_delay));
+}
+
+#[tokio::test]
+async fn skip_precedes_interpolation_and_masks_secret_condition_values() {
+    let doc = reqv1::RequestDocument::parse(
+        r#"{"formatVersion":1,"kind":"request","meta":{"id":"optional","name":"Optional"},
+            "execution":{"skip":{"reason":"optional service unavailable","when":{"all":[
+                {"var":{"scope":"secret","name":"apiToken"}},
+                {"not":{"var":{"scope":"runtime","name":"disabled"}}}
+            ]}}},"request":{"method":"GET","url":"${env.missing}/resource"}}"#,
+    )
+    .unwrap();
+    let result = reqv1::run_with_runtime(
+        &doc,
+        &project_root(),
+        &request_file(),
+        json!({}),
+        &secret,
+        &HttpEngine::new(),
+        RunMode::Http,
+        CancellationToken::new(),
+        Value::Null,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(result.status, RunStatus::Skipped);
+    assert_eq!(
+        result.skip_reason.as_deref(),
+        Some("optional service unavailable")
+    );
+    assert!(result.http.is_none());
+    assert!(result.assertions.is_empty());
+    assert!(!serde_json::to_string(&result)
+        .unwrap()
+        .contains("s3cr3t-token"));
+}
+
+#[tokio::test]
+async fn execution_conditions_use_bruno_truthiness() {
+    let base = |value: Option<Value>| {
+        let env = value
+            .map(|value| json!({"flag": value}))
+            .unwrap_or_else(|| json!({}));
+        (env, HttpEngine::new())
+    };
+    let doc = reqv1::RequestDocument::parse(
+        r#"{"formatVersion":1,"kind":"request","meta":{"id":"truthy","name":"Truthy"},
+            "execution":{"skip":{"reason":"truthy","when":{"var":{"scope":"env","name":"flag"}}}},
+            "request":{"method":"GET","url":"http://unused"},"mock":{"status":200}}"#,
+    )
+    .unwrap();
+    for value in [
+        None,
+        Some(Value::Null),
+        Some(json!(false)),
+        Some(json!(0)),
+        Some(json!("")),
+    ] {
+        let (env, engine) = base(value);
+        let result = reqv1::run(
+            &doc,
+            &project_root(),
+            &request_file(),
+            env,
+            &secret,
+            &engine,
+            RunMode::Mock,
+            CancellationToken::new(),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(result.status, RunStatus::Passed);
+    }
+    for value in [json!(true), json!(1), json!("x"), json!([]), json!({})] {
+        let (env, engine) = base(Some(value));
+        let result = reqv1::run(
+            &doc,
+            &project_root(),
+            &request_file(),
+            env,
+            &secret,
+            &engine,
+            RunMode::Mock,
+            CancellationToken::new(),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(result.status, RunStatus::Skipped);
+    }
+}
+
+#[tokio::test]
+async fn skipped_sequence_step_preserves_position_and_continues() {
+    let root = tempfile::tempdir().unwrap();
+    let requests = root.path().join("requests");
+    std::fs::create_dir_all(&requests).unwrap();
+    let skipped = requests.join("optional.request.json");
+    let next = requests.join("next.request.json");
+    std::fs::write(
+        &skipped,
+        r#"{"formatVersion":1,"kind":"request","meta":{"id":"optional","name":"Optional"},
+            "execution":{"skip":{"reason":"not configured","when":{"literal":true}}},
+            "request":{"method":"GET","url":"${env.missing}"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &next,
+        r#"{"formatVersion":1,"kind":"request","meta":{"id":"next","name":"Next"},
+            "request":{"method":"GET","url":"http://unused"},"mock":{"status":204}}"#,
+    )
+    .unwrap();
+
+    let results = reqv1::run_sequence(
+        &[skipped, next],
+        root.path(),
+        json!({}),
+        &|_| None,
+        &HttpEngine::new(),
+        RunMode::Mock,
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].request_id, "optional");
+    assert_eq!(results[0].status, RunStatus::Skipped);
+    assert_eq!(results[1].request_id, "next");
+    assert_eq!(results[1].status, RunStatus::Passed);
+}
+
+#[tokio::test]
+async fn pre_request_delay_is_cancellable_without_waiting_or_transport() {
+    let doc = reqv1::RequestDocument::parse(
+        r#"{"formatVersion":1,"kind":"request","meta":{"id":"delayed","name":"Delayed"},
+            "execution":{"delayBeforeMs":90000},
+            "request":{"method":"GET","url":"http://127.0.0.1:9/never-sent"}}"#,
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let result = reqv1::run(
+        &doc,
+        &project_root(),
+        &request_file(),
+        json!({}),
+        &secret,
+        &HttpEngine::new(),
+        RunMode::Http,
+        cancel,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(result.status, RunStatus::Error);
+    assert!(result.http.is_none());
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("pre-request delay")));
 }
 
 #[tokio::test]
@@ -376,6 +674,52 @@ fn matrix_binding_must_be_an_array() {
             .any(|d| d.message.contains("must resolve to an array")),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+async fn matrix_project_code_is_blocked_before_binding_resolution() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("project.json"), "{}").unwrap();
+    let request = root.path().join("requests/matrix.request.json");
+    std::fs::create_dir_all(request.parent().unwrap()).unwrap();
+    let doc = reqv1::RequestDocument::parse(
+        r#"{
+            "formatVersion": 1,
+            "kind": "request",
+            "meta": {"id": "matrix.code", "name": "Matrix code"},
+            "matrix": {
+                "case": {"use": "project:generators/untrusted"}
+            },
+            "request": {"method": "GET", "url": "https://example.test"},
+            "mock": {
+                "status": 200,
+                "headers": [],
+                "body": {"type": "text", "value": "ok"}
+            }
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(&request, serde_json::to_vec_pretty(&doc).unwrap()).unwrap();
+    let auth = reqv1::AuthSession::with_project_code_allowed(false);
+
+    let error = reqv1::run_matrix_with_responses_in_session(
+        &doc,
+        root.path(),
+        &request,
+        json!({}),
+        &|_| None,
+        &HttpEngine::new(),
+        RunMode::Mock,
+        CancellationToken::new(),
+        &auth,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.0.len(), 1);
+    assert!(error.0[0]
+        .message
+        .contains("project-owned JavaScript, but project code is disabled"));
 }
 
 #[tokio::test]
@@ -500,10 +844,7 @@ async fn runtime_and_per_request_environments_thread_through_a_sequence() {
         "{:?}",
         results[0].0.diagnostics
     );
-    assert_eq!(
-        results[0].0.runtime.get("authToken"),
-        Some(&json!("tok-xyz"))
-    );
+    assert_eq!(results[0].0.runtime.get("authToken"), Some(&json!("***")));
     assert_eq!(
         results[0].1.as_ref().map(|response| response.status),
         Some(200)
@@ -747,6 +1088,51 @@ async fn project_auth_fetcher_reuses_a_live_bearer_token() {
 }
 
 #[tokio::test]
+async fn project_auth_policy_blocks_code_in_the_loaded_provider_document() {
+    let server = MockServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let (file, doc) = auth_project(root.path(), &server, 60);
+    let provider = root.path().join("requests/auth/token.request.json");
+    std::fs::write(
+        reqv1::hooks_path(&provider),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "kind": "hooks",
+            "hooks": [{
+                "phase": "beforeRequest",
+                "use": "project:hooks/untrusted"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let auth = reqv1::AuthSession::with_project_code_allowed(false);
+
+    let (result, response) = reqv1::run_with_response_in_session(
+        &doc,
+        root.path(),
+        &file,
+        json!({}),
+        &|_| None,
+        &HttpEngine::new(),
+        RunMode::Http,
+        CancellationToken::new(),
+        Value::Null,
+        &auth,
+    )
+    .await;
+
+    assert_eq!(result.status, RunStatus::Error);
+    assert!(response.is_none());
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains(
+            "auth request requests/auth/token.request.json executes project-owned JavaScript"
+        )));
+}
+
+#[tokio::test]
 async fn project_auth_refreshes_before_observed_request_duration_exceeds_ttl() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -786,4 +1172,343 @@ async fn project_auth_refreshes_before_observed_request_duration_exceeds_ttl() {
         assert_eq!(result.status, RunStatus::Passed, "{:?}", result.diagnostics);
     }
     server.verify().await;
+}
+
+#[tokio::test]
+async fn named_project_auth_refreshes_before_observed_request_duration_exceeds_ttl() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "token-1"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/me"))
+        .and(header("authorization", "Bearer token-1"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(1_200)))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    let (file, mut doc) = auth_project(root.path(), &server, 2);
+    doc.auth = Some(reqv1::RequestAuthSelection::provider("short-lived"));
+    std::fs::write(
+        root.path().join("project.json"),
+        serde_json::to_vec_pretty(&json!({
+            "authProviders": {"short-lived": {
+                "request": "requests/auth/token.request.json",
+                "lifetimeSeconds": 2,
+                "refreshBeforeSeconds": 0,
+                "applyTo": "requests/protected"
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let engine = HttpEngine::new();
+    let auth = reqv1::AuthSession::default();
+    for _ in 0..2 {
+        let (result, _) = reqv1::run_with_response_in_session(
+            &doc,
+            root.path(),
+            &file,
+            json!({}),
+            &|_| None,
+            &engine,
+            RunMode::Http,
+            CancellationToken::new(),
+            Value::Null,
+            &auth,
+        )
+        .await;
+        assert_eq!(result.status, RunStatus::Passed, "{:?}", result.diagnostics);
+    }
+    server.verify().await;
+}
+
+fn write_request(root: &Path, relative: &str, value: Value) -> reqv1::RequestDocument {
+    let file = root.join(relative);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    reqv1::RequestDocument::parse(&value.to_string()).unwrap()
+}
+
+#[tokio::test]
+async fn named_auth_providers_have_isolated_caches_and_explicit_selection() {
+    let server = MockServer::start().await;
+    for (path_value, token) in [("/token-a", "token-a"), ("/token-b", "token-b")] {
+        Mock::given(method("POST"))
+            .and(path(path_value))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": token
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    for (path_value, token) in [("/a", "token-a"), ("/b", "token-b")] {
+        Mock::given(method("GET"))
+            .and(path(path_value))
+            .and(header("authorization", format!("Bearer {token}")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    for name in ["a", "b"] {
+        write_request(
+            root.path(),
+            &format!("requests/auth/{name}.request.json"),
+            json!({
+                "formatVersion": 1, "kind": "request", "auth": "none",
+                "meta": {"id": format!("auth.{name}"), "name": name},
+                "request": {"method": "POST", "url": format!("{}/token-{name}", server.uri())}
+            }),
+        );
+    }
+    std::fs::write(
+        root.path().join("project.json"),
+        serde_json::to_vec_pretty(&json!({
+            "authProviders": {
+                "a": {"request": "requests/auth/a.request.json", "applyTo": "requests/a"},
+                "b": {"request": "requests/auth/b.request.json", "applyTo": "requests/b"}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let file_a = root.path().join("requests/a/get.request.json");
+    let file_b = root.path().join("requests/b/get.request.json");
+    let doc_a = write_request(
+        root.path(),
+        "requests/a/get.request.json",
+        json!({"formatVersion":1,"kind":"request","auth":"a","meta":{"id":"a","name":"a"},
+            "request":{"method":"GET","url":format!("{}/a", server.uri())}}),
+    );
+    let doc_b = write_request(
+        root.path(),
+        "requests/b/get.request.json",
+        json!({"formatVersion":1,"kind":"request","auth":"b","meta":{"id":"b","name":"b"},
+            "request":{"method":"GET","url":format!("{}/b", server.uri())}}),
+    );
+    let engine = HttpEngine::new();
+    let auth = reqv1::AuthSession::default();
+    for _ in 0..2 {
+        for (doc, file) in [(&doc_a, &file_a), (&doc_b, &file_b)] {
+            let (result, _) = reqv1::run_with_response_in_session(
+                doc,
+                root.path(),
+                file,
+                json!({}),
+                &|_| None,
+                &engine,
+                RunMode::Http,
+                CancellationToken::new(),
+                Value::Null,
+                &auth,
+            )
+            .await;
+            assert_eq!(result.status, RunStatus::Passed, "{:?}", result.diagnostics);
+        }
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn named_auth_uses_most_specific_scope_and_fails_closed_on_ambiguity() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/specific-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"specific"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/target"))
+        .and(header("authorization", "Bearer specific"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    for (name, endpoint) in [("broad", "/broad-token"), ("specific", "/specific-token")] {
+        write_request(
+            root.path(),
+            &format!("requests/auth/{name}.request.json"),
+            json!({"formatVersion":1,"kind":"request","auth":"none",
+                "meta":{"id":name,"name":name},
+                "request":{"method":"POST","url":format!("{}{endpoint}", server.uri())}}),
+        );
+    }
+    let target_file = root.path().join("requests/private/target.request.json");
+    let target = write_request(
+        root.path(),
+        "requests/private/target.request.json",
+        json!({"formatVersion":1,"kind":"request","meta":{"id":"target","name":"target"},
+            "request":{"method":"GET","url":format!("{}/target",server.uri())}}),
+    );
+    let write_project = |providers: Value| {
+        std::fs::write(
+            root.path().join("project.json"),
+            serde_json::to_vec_pretty(&json!({"authProviders": providers})).unwrap(),
+        )
+        .unwrap();
+    };
+    write_project(json!({
+        "broad":{"request":"requests/auth/broad.request.json","applyTo":"requests"},
+        "specific":{"request":"requests/auth/specific.request.json","applyTo":"requests/private"}
+    }));
+    let engine = HttpEngine::new();
+    let (result, _) = reqv1::run_with_response(
+        &target,
+        root.path(),
+        &target_file,
+        json!({}),
+        &|_| None,
+        &engine,
+        RunMode::Http,
+        CancellationToken::new(),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(result.status, RunStatus::Passed, "{:?}", result.diagnostics);
+
+    write_project(json!({
+        "first":{"request":"requests/auth/broad.request.json","applyTo":"requests/private"},
+        "second":{"request":"requests/auth/specific.request.json","applyTo":"requests/private"}
+    }));
+    let (ambiguous, _) = reqv1::run_with_response(
+        &target,
+        root.path(),
+        &target_file,
+        json!({}),
+        &|_| None,
+        &engine,
+        RunMode::Http,
+        CancellationToken::new(),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(ambiguous.status, RunStatus::Error);
+    assert!(ambiguous.diagnostics[0]
+        .message
+        .contains("ambiguous auth providers"));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn explicit_none_and_provider_requests_never_receive_automatic_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/public"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"token"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    let provider_file = root.path().join("requests/auth/token.request.json");
+    let provider = write_request(
+        root.path(),
+        "requests/auth/token.request.json",
+        json!({"formatVersion":1,"kind":"request","meta":{"id":"auth","name":"auth"},
+            "request":{"method":"POST","url":format!("{}/token",server.uri())}}),
+    );
+    let public_file = root.path().join("requests/public.request.json");
+    let public = write_request(
+        root.path(),
+        "requests/public.request.json",
+        json!({"formatVersion":1,"kind":"request","auth":"none","meta":{"id":"public","name":"public"},
+            "request":{"method":"GET","url":format!("{}/public",server.uri())}}),
+    );
+    std::fs::write(
+        root.path().join("project.json"),
+        serde_json::to_vec_pretty(&json!({"authProviders":{
+            "all":{"request":"requests/auth/token.request.json","applyTo":"requests"}
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    let engine = HttpEngine::new();
+    for (doc, file) in [(&public, &public_file), (&provider, &provider_file)] {
+        let (result, _) = reqv1::run_with_response(
+            doc,
+            root.path(),
+            file,
+            json!({}),
+            &|_| None,
+            &engine,
+            RunMode::Http,
+            CancellationToken::new(),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(result.status, RunStatus::Passed, "{:?}", result.diagnostics);
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.headers.get("authorization").is_none()));
+}
+
+#[tokio::test]
+async fn named_auth_missing_credentials_fail_before_send_with_masked_diagnostic() {
+    let server = MockServer::start().await;
+    let root = tempfile::tempdir().unwrap();
+    write_request(
+        root.path(),
+        "requests/auth/keycloak.request.json",
+        json!({"formatVersion":1,"kind":"request","auth":"none",
+            "meta":{"id":"auth.keycloak","name":"keycloak"},
+            "request":{"method":"POST","url":format!("{}/token",server.uri()),
+                "body":{"type":"form","value":{"grant_type":"client_credentials",
+                    "client_secret":"${secret.keycloak_client_secret}"}}}}),
+    );
+    let target_file = root.path().join("requests/private.request.json");
+    let target = write_request(
+        root.path(),
+        "requests/private.request.json",
+        json!({"formatVersion":1,"kind":"request","auth":"keycloak",
+            "meta":{"id":"private","name":"private"},
+            "request":{"method":"GET","url":format!("{}/private",server.uri())}}),
+    );
+    std::fs::write(
+        root.path().join("project.json"),
+        serde_json::to_vec_pretty(&json!({"authProviders":{"keycloak":{
+            "request":"requests/auth/keycloak.request.json","applyTo":"requests"
+        }}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let engine = HttpEngine::new();
+    let (result, _) = reqv1::run_with_response(
+        &target,
+        root.path(),
+        &target_file,
+        json!({}),
+        &|_| None,
+        &engine,
+        RunMode::Http,
+        CancellationToken::new(),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(result.status, RunStatus::Error);
+    assert!(result.diagnostics[0]
+        .message
+        .contains("keycloak_client_secret"));
+    assert!(!result.diagnostics[0].message.contains("Bearer"));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

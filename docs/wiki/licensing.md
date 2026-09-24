@@ -10,19 +10,37 @@ ApiWright has three plans. The full legal terms live in
 | Pro | 12 € per user / month | Any commercial use. Billed monthly, cancel anytime. |
 | Enterprise | Custom | Commercial use with a license server hosted in your own infrastructure, volume pricing and invoicing. |
 
-## Pro features
+## Source-available core and premium boundary
 
-Some team-oriented features require a Pro or Enterprise license (or an
-active commercial trial). Currently: the Jira integration (link editing,
-ticket details, comments) and the ticket/OpenAPI coverage report —
-existing Jira links stay visible on every plan. More team features will
-follow the same rule: solo, noncommercial work stays fully functional on
-Free.
+The local product model separates API-testing capability from organization
+governance:
 
-ApiWright is open core: the Pro engine lives in a private `forge-pro` crate
-that only official release builds link in (`--features pro`). Building
-this repository yourself always produces the Free edition; the public
-code compiles without the private crate.
+| Capability | Free / source-available | Pro | Enterprise |
+| --- | --- | --- | --- |
+| Local IDE, CLI, request-v1 model, OpenAPI, mocks, validation and execution | Yes, for noncommercial use | Yes | Yes |
+| Local `apiwright mcp` server and Codex plugin | Yes, for noncommercial use | Yes | Yes |
+| Existing Jira links remain visible, copyable and openable | Yes | Yes | Yes |
+| Create/edit Jira links, fetch ticket details and post comments | No | Yes | Yes |
+| Ticket/OpenAPI/history coverage report and Jira report comments | No | Yes | Yes |
+| Commercial-use entitlement | No, except during the trial | Yes | Yes |
+| Customer-hosted license server, volume terms and invoicing | No | No | Yes |
+
+The MCP stays in the public adapter layer for the same reason as the CLI: it
+reuses `forge-core` rather than owning product rules. Paid value sits at the
+team and governance boundary. If hosted MCP, central policy/approval, SSO/RBAC,
+or organization audit capabilities are introduced later, they belong on the
+premium side; this table does not claim those services exist today.
+
+The Pro engine lives in a private `forge-pro` crate. Building this repository
+or downloading artifacts from its tracked public release workflow currently
+produces the Free edition; the public crates compile without the private
+overlay. A separate private distribution pipeline must supply `forge-pro` and
+build with `--features pro` to produce Pro or Enterprise artifacts. The local
+MCP therefore exposes only public core capabilities and does not bypass or
+emulate Pro entitlements.
+
+See [Jira integration](jira.md) for the current premium workflow and
+[MCP and AI automation](mcp.md) for the source-available local AI adapter.
 
 ## 60-day commercial trial
 
@@ -48,7 +66,8 @@ interrupted mid-subscription.
 
 ## Free and commercial use
 
-The Free plan is not enforced technically — ApiWright sends no telemetry and
-does not try to detect where it runs. Using ApiWright for a commercial purpose
-without a paid license is a violation of the license terms, not a technical
-impossibility.
+The noncommercial source license is not enforced through telemetry — ApiWright
+does not try to infer how a local project is used. Using ApiWright for a
+commercial purpose without a paid license or active trial violates the license
+terms even when the source-available core binary is technically able to run
+the project.

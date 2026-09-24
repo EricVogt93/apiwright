@@ -107,21 +107,53 @@ pub fn rename_request(file: &Path, new_name: &str) -> StoreResult<PathBuf> {
 pub fn rename_folder(dir: &Path, new_name: &str) -> StoreResult<PathBuf> {
     let slug = slugify(new_name);
     validate_name(&slug)?;
+    let new_dir = dir.with_file_name(&slug);
+    if new_dir != dir && new_dir.exists() {
+        return Err(StoreError::AlreadyExists(new_dir));
+    }
     let meta_path = dir.join(FOLDER_FILE);
-    let mut meta: FolderMeta = if meta_path.is_file() {
+    let original = if meta_path.is_file() {
+        Some(std::fs::read(&meta_path).map_err(io_err(&meta_path))?)
+    } else {
+        None
+    };
+    let mut meta: FolderMeta = if original.is_some() {
         load_json(&meta_path)?
     } else {
         FolderMeta::default()
     };
     meta.name = new_name.to_string();
-    save_json(&meta_path, &meta)?;
-    let new_dir = dir.with_file_name(&slug);
-    if new_dir != dir {
-        if new_dir.exists() {
-            return Err(StoreError::AlreadyExists(new_dir));
+    if new_dir == dir {
+        save_json(&meta_path, &meta)?;
+        return Ok(new_dir);
+    }
+    // Validate parent metadata before moving anything.
+    if let Some((path, collection)) = parent_order_file(dir) {
+        if collection {
+            let _: CollectionMeta = load_json(&path)?;
+        } else {
+            let _: FolderMeta = load_json(&path)?;
         }
-        std::fs::rename(dir, &new_dir).map_err(io_err(dir))?;
-        rename_in_parent_order(dir, &new_dir)?;
+    }
+    std::fs::rename(dir, &new_dir).map_err(io_err(dir))?;
+    let new_meta = new_dir.join(FOLDER_FILE);
+    let result = save_json(&new_meta, &meta).and_then(|()| rename_in_parent_order(dir, &new_dir));
+    if let Err(error) = result {
+        let rollback = (|| -> StoreResult<()> {
+            if let Some(bytes) = original {
+                super::atomic_write(&new_meta, |file| std::io::Write::write_all(file, &bytes))?;
+            } else if new_meta.is_file() {
+                std::fs::remove_file(&new_meta).map_err(io_err(&new_meta))?;
+            }
+            std::fs::rename(&new_dir, dir).map_err(io_err(&new_dir))
+        })();
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(io_err(dir)(std::io::Error::other(format!(
+                "{error}; rollback failed: {rollback}; inspect {}",
+                new_dir.display()
+            )))),
+        };
     }
     Ok(new_dir)
 }

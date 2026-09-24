@@ -23,7 +23,7 @@ the other entries belong in the named hook/assertion phase.
 | `builtin:header@1` | Prepare / `beforeRequest` | `name: string`, `value: string` required | Adds/replaces one request header |
 | `builtin:assert-status@1` | Validate / `afterResponse` | `expected: integer` required | Exact response status |
 | `builtin:assert-json-path@1` | Validate / `afterResponse` | `path: string` required; `operator = exists`; optional `value: JSON` | `exists`, `notExists`, `equals` or string `contains` |
-| `builtin:assert-schema@1` | Validate / `afterResponse` | `schema: JSON` required | Response JSON against JSON Schema |
+| `builtin:assert-schema@1` | Validate / `afterResponse` | exactly one of `schema: JSON` or `schemaRef: string`; optional `definition`, `instancePatch`, `name` | Response JSON against JSON Schema; named `$defs` keep the complete document as their reference root |
 | `builtin:assert-header@1` | Validate / `afterResponse` | `name: string` required; optional `value: string` | Presence, or case-insensitive value equality |
 | `builtin:assert-response-time@1` | Validate / `afterResponse` | `maxMs: integer > 0` required | Elapsed time must be strictly below the limit |
 | `builtin:assert-body-text@1` | Validate / `afterResponse` | `text: string` required | Body contains literal text |
@@ -39,6 +39,13 @@ the other entries belong in the named hook/assertion phase.
 request. `specRef` is resolved relative to that request and may point at JSON or YAML;
 it cannot contain a JSON Pointer. The assertion requires exactly one of `spec` and
 `specRef`.
+
+`assert-schema` resolves `schemaRef` relative to the request and inside the
+project. `definition` must name an existing top-level `$defs` entry or the
+request fails closed during resolution. `instancePatch`, when present, is an
+RFC 6902 patch applied to a copy of the response before validation. Supported
+formats, including `date`, `date-time`, `email`, and `idn-email`, are enforced;
+unknown formats remain annotations.
 
 Builtin validation rejects unknown parameters, missing required values, wrong JSON
 types, unsupported options, invalid JSONPath/regex syntax, the wrong execution phase and

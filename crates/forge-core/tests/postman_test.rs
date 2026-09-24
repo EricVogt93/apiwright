@@ -35,6 +35,35 @@ fn imports_collection_metadata_variables_and_auth() {
 }
 
 #[test]
+fn collection_secret_variables_are_not_plain_collection_values() {
+    let import = parse_postman(
+        r#"{
+          "info":{"name":"Secrets"},
+          "variable":[
+            {"key":"baseUrl","value":"https://example.test"},
+            {"key":"token","value":"secret-value","type":"secret"}
+          ],
+          "item":[]
+        }"#,
+    )
+    .expect("collection should parse");
+
+    assert_eq!(
+        import.variables.get("baseUrl").map(String::as_str),
+        Some("https://example.test")
+    );
+    assert!(!import.variables.contains_key("token"));
+    assert_eq!(
+        import.secret_variables.get("token").map(String::as_str),
+        Some("secret-value")
+    );
+    assert!(import
+        .skipped
+        .iter()
+        .any(|warning| warning.contains("secret variable 'token'")));
+}
+
+#[test]
 fn imports_folder_tree_with_folder_level_auth() {
     let import = parse_postman(COLLECTION).expect("fixture should parse");
 
@@ -103,6 +132,38 @@ fn imports_request_with_headers_query_params_and_json_body() {
         panic!("json body, got {:?}", def.body)
     };
     assert!(text.contains("\"currency\": \"eur\""));
+}
+
+#[test]
+fn imports_query_parameters_embedded_in_a_raw_url() {
+    let import = parse_postman(
+        r#"{
+          "info":{"name":"Raw URL collection"},
+          "item":[{
+            "name":"Search",
+            "request":{
+              "method":"GET",
+              "url":"https://api.example.test/search?q=two%20words&empty=#summary"
+            }
+          }]
+        }"#,
+    )
+    .expect("collection should parse");
+    let ImportedItem::Request(request) = &import.items[0] else {
+        panic!("expected a request")
+    };
+
+    assert_eq!(request.url, "https://api.example.test/search#summary");
+    let query = request
+        .params
+        .iter()
+        .filter(|parameter| parameter.kind == ParamKind::Query)
+        .collect::<Vec<_>>();
+    assert_eq!(query.len(), 2);
+    assert_eq!(query[0].kv.key, "q");
+    assert_eq!(query[0].kv.value, "two words");
+    assert_eq!(query[1].kv.key, "empty");
+    assert_eq!(query[1].kv.value, "");
 }
 
 #[test]
@@ -222,41 +283,31 @@ fn imports_graphql_body_and_ntlm_auth() {
 }
 
 #[test]
-fn imports_scripts_as_js_and_reports_example_responses() {
-    use forge_core::model::ScriptLang;
-
+fn quarantines_scripts_and_reports_example_responses() {
     let import = parse_postman(COLLECTION).expect("fixture should parse");
 
-    // Collection prerequest event becomes a beforeEach suite hook.
-    assert_eq!(import.hooks.language, ScriptLang::Js);
-    let before_each = import
-        .hooks
-        .before_each
-        .as_deref()
-        .expect("collection prerequest imported");
-    assert!(before_each.contains("pm.variables.set"), "{before_each:?}");
-    assert!(import.hooks.after_each.is_none());
+    assert!(import.hooks.is_empty());
 
-    // Request test event becomes its JS post-response script.
     let ImportedItem::Folder { items, .. } = &import.items[0] else {
         panic!("folder")
     };
     let ImportedItem::Request(def) = &items[0] else {
         panic!("request")
     };
-    assert_eq!(def.scripts.language, ScriptLang::Js);
-    let post = def
-        .scripts
-        .post_response
-        .as_deref()
-        .expect("test script imported");
-    assert!(post.contains("pm.test('status 201'"), "{post:?}");
-    assert!(def.scripts.pre_request.is_none());
+    assert!(def.scripts.is_empty());
+    assert_eq!(import.quarantine.len(), 2);
+    assert!(import.quarantine.iter().any(|entry| {
+        entry.category == forge_core::convert::QuarantineCategory::BeforeEach
+            && entry.script.contains("pm.variables.set")
+    }));
+    assert!(import.quarantine.iter().any(|entry| {
+        entry.category == forge_core::convert::QuarantineCategory::Assertion
+            && entry.script.contains("pm.test('status 201'")
+    }));
 
-    // Scripts no longer appear in the skip list; example responses still do.
     assert!(
         !import.skipped.iter().any(|s| s.contains("script")),
-        "scripts should import, not skip: {:?}",
+        "scripts should quarantine, not skip: {:?}",
         import.skipped
     );
     assert!(
@@ -267,6 +318,25 @@ fn imports_scripts_as_js_and_reports_example_responses() {
         "example responses should be reported: {:?}",
         import.skipped
     );
+}
+
+#[test]
+fn duplicate_item_names_have_distinct_quarantine_ids() {
+    let collection = r#"{
+        "info": {"name": "Duplicate names"},
+        "item": [
+            {"name": "Get", "request": "https://example.test/1", "event": [
+                {"listen": "test", "script": {"exec": ["pm.test('ok', () => {});"]}}
+            ]},
+            {"name": "Get", "request": "https://example.test/2", "event": [
+                {"listen": "test", "script": {"exec": ["pm.test('ok', () => {});"]}}
+            ]}
+        ]
+    }"#;
+    let import = parse_postman(collection).unwrap();
+
+    assert_eq!(import.quarantine.len(), 2);
+    assert_ne!(import.quarantine[0].id, import.quarantine[1].id);
 }
 
 #[test]

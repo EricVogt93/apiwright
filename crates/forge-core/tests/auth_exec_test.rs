@@ -399,3 +399,79 @@ async fn ntlm_without_credentials_stays_a_plain_401() {
         .expect("request should succeed");
     assert_eq!(res.status, 401);
 }
+
+#[tokio::test]
+async fn cross_origin_redirect_never_reuses_challenge_or_signature_credentials() {
+    use forge_core::exec::NtlmCredentials;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for scheme in ["digest", "ntlm", "sigv4"] {
+        let target = MockServer::start().await;
+        let challenge = if scheme == "digest" {
+            "Digest realm=\"foreign\", nonce=\"nonce\", qop=\"auth\", algorithm=MD5"
+        } else {
+            "NTLM"
+        };
+        Mock::given(path("/target"))
+            .respond_with(ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge))
+            .mount(&target)
+            .await;
+        let origin = MockServer::start().await;
+        Mock::given(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/target", target.uri())),
+            )
+            .mount(&origin)
+            .await;
+        let mut req = ResolvedRequest::new(Method::Get, format!("{}/start", origin.uri()));
+        match scheme {
+            "digest" => {
+                req.digest = Some(DigestCredentials {
+                    username: "test-user".into(),
+                    password: "test-password".into(),
+                })
+            }
+            "ntlm" => {
+                req.ntlm = Some(NtlmCredentials {
+                    username: "test-user".into(),
+                    password: "test-password".into(),
+                    domain: "TEST".into(),
+                })
+            }
+            _ => {
+                req.sigv4 = Some(SigV4Params {
+                    access_key: "test-access-key".into(),
+                    secret_key: "test-secret-key".into(),
+                    session_token: Some("test-session-token".into()),
+                    region: "us-east-1".into(),
+                    service: "execute-api".into(),
+                })
+            }
+        }
+        let result = HttpEngine::new()
+            .execute(req, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.status, 401);
+        let received = target.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "{scheme} must not answer a foreign challenge"
+        );
+        assert!(
+            received[0].headers.get("authorization").is_none(),
+            "{scheme}"
+        );
+        assert!(
+            received[0].headers.get("x-amz-security-token").is_none(),
+            "{scheme}"
+        );
+        if scheme == "sigv4" {
+            let sent = origin.received_requests().await.unwrap();
+            assert!(sent[0].headers.get("authorization").is_some());
+        }
+    }
+}

@@ -1,12 +1,12 @@
 # Authentication
 
-ApiWright supports request-local authentication and a project auth fetcher for short-lived Bearer tokens. The latter runs an ordinary request, extracts a token, caches it, and refreshes before a protected call can outlive the remaining lifetime.
+ApiWright supports request-local authentication and named project auth fetchers for short-lived Bearer tokens. Each fetcher runs an ordinary request, extracts a token, caches it, and refreshes before a protected call can outlive the remaining lifetime. The original single `project.json.auth` form remains supported unchanged.
 
 ## Request-local authentication
 
 For legacy request forms, the authorization selector supports inherit, none, Basic, Bearer, API key, Digest, NTLM, AWS Signature v4, and OAuth 2.0 Client Credentials. An enabled explicit `Authorization` header also counts as request-local auth.
 
-For request-format v1, reusable `beforeRequest` catalog entries can add Bearer, Basic, or an `Authorization` header. Explicit request auth wins: project auth is not injected when such a header or enabled auth hook already exists.
+For request-format v1, reusable `beforeRequest` catalog entries can add Bearer, Basic, or an `Authorization` header. Explicit request auth wins: project auth is not injected when such a header or enabled auth hook already exists. A request can also set `"auth": "provider-name"` or `"auth": "none"`.
 
 ## Reuse an existing request as project auth
 
@@ -32,6 +32,26 @@ The configuration lives in `project.json`:
 
 `request` and `applyTo` must be project-relative and cannot contain `..`. `request` must end in `.request.json`; `tokenPath` must select a non-empty string. Lifetime must be positive and greater than the refresh reserve. `applyTo` accepts one request file or an entire request folder. The auth request never authenticates itself.
 
+## Named scoped providers
+
+Named providers use the same settings and ordinary request documents:
+
+```json
+{
+  "authProviders": {
+    "keycloak": {
+      "request": "requests/auth/keycloak.request.json",
+      "tokenPath": "$.access_token",
+      "lifetimeSeconds": 300,
+      "refreshBeforeSeconds": 30,
+      "applyTo": "requests/internal"
+    }
+  }
+}
+```
+
+Provider precedence is explicit request selection, then the named provider with the longest matching `applyTo` path, then legacy `project.json.auth`. `"auth": "none"` disables automatic auth. Equal-length matching named scopes are an error and send no protected request. A request with an explicit Authorization header/hook keeps that request-local auth. Every configured provider request is excluded from automatic auth, so providers cannot recursively authenticate themselves or each other.
+
 ## Create a provider request
 
 Choose **Provider setup** in the Auth tab. ApiWright creates a normal form-encoded Client Credentials request below `requests/auth/`, activates it, and keeps it editable:
@@ -47,7 +67,7 @@ If a client secret is entered, ApiWright writes it to `.env.local` as `OAUTH_CLI
 
 ## Cache and predictive refresh
 
-The cache key includes project, auth request, effective environment, auth settings, and run mode. A token is reused only when its remaining lifetime is greater than:
+The cache key includes project, auth request, effective environment, auth settings, and run mode. Named providers therefore cache and refresh independently. A token is reused only when its remaining lifetime is greater than:
 
 ```text
 refresh reserve + longest observed duration of this protected request

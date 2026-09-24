@@ -13,11 +13,12 @@ ApiWright is a local-first IDE for API requests and executable API tests. This w
 - [OpenAPI](openapi.md) — completion, validation, coverage and generators.
 - [Authentication](authentication.md) — bearer/basic providers and refresh.
 - [AI Advisor](advisor.md) — context assembly, redaction and configuration.
+- [MCP and AI automation](mcp.md) — inspect, edit, validate and run saved projects from AI clients.
 - [Protocols](protocols.md) — HTTP, GraphQL, WebSocket, SSE and gRPC.
 - [Import and export](import-export.md) — lossless bundles, snippets and migrations.
 - [Secrets and security](security.md) — local state, masking and project code.
 - [Jira integration](jira.md) — ticket links, live details and comments from the project tree.
-- [Licensing and billing](licensing.md) — Free, Pro and Enterprise plans and license activation.
+- [Licensing and billing](licensing.md) — source-available core, premium boundaries and license activation.
 - [CLI and CI](cli.md) — deterministic local and pipeline execution.
 - [Architecture](architecture.md) — ports, adapters and dependency direction.
 - [Development](development.md) — build, test, repository conventions and extension points.

@@ -44,6 +44,10 @@ Redaction is a safety net, not a data-classification system. Plain text, unusual
 
 The provider receives one system instruction, the question, and the assembled API context. ApiWright does not send the complete repository, execute model suggestions, or grant the model filesystem access.
 
+For AI-driven edits or test execution over saved files, use the separate
+[MCP adapter](mcp.md). Its tools have explicit write and network boundaries;
+the Advisor remains read-only.
+
 ## Troubleshooting
 
 - **Ask advisor is disabled:** endpoint or model is empty, or a request is already in flight.

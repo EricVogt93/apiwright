@@ -39,6 +39,14 @@
       "additionalProperties": { "$ref": "#/$defs/binding" }
     },
 
+    "execution": { "$ref": "#/$defs/executionPolicy" },
+
+    "auth": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Explicit named project auth provider, or 'none' to disable automatic auth."
+    },
+
     "request": {
       "type": "object",
       "required": ["method", "url"],
@@ -57,7 +65,8 @@
           "type": "array",
           "items": { "$ref": "#/$defs/header" }
         },
-        "body": { "$ref": "#/$defs/body" }
+        "body": { "$ref": "#/$defs/body" },
+        "settings": { "$ref": "#/$defs/requestSettings" }
       }
     },
 
@@ -134,10 +143,32 @@
       "oneOf": [
         {
           "type": "object",
+          "required": ["type", "parts"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "multipart" },
+            "parts": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/multipartPart" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "file"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "binary" },
+            "file": { "$ref": "#/$defs/assetRef" },
+            "contentType": { "type": "string", "minLength": 1 }
+          }
+        },
+        {
+          "type": "object",
           "required": ["type"],
           "additionalProperties": false,
           "properties": {
-            "type": { "enum": ["json", "text", "form", "multipart", "binary", "none"] },
+            "type": { "enum": ["json", "text", "form", "none"] },
             "value": {}
           }
         },
@@ -147,10 +178,124 @@
           "additionalProperties": false,
           "properties": {
             "ref": { "$ref": "#/$defs/assetRef" },
-            "type": { "enum": ["json", "text", "form", "multipart", "binary"] }
+            "type": { "enum": ["json", "text", "form"] }
           }
         }
       ]
+    },
+
+    "multipartPart": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "name", "value"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "text" },
+            "name": { "type": "string", "minLength": 1 },
+            "value": { "type": "string" },
+            "filename": { "type": "string", "minLength": 1 },
+            "contentType": { "type": "string", "minLength": 1 },
+            "enabled": { "type": "boolean", "default": true }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "name", "file"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "file" },
+            "name": { "type": "string", "minLength": 1 },
+            "file": { "$ref": "#/$defs/assetRef" },
+            "filename": { "type": "string", "minLength": 1 },
+            "contentType": { "type": "string", "minLength": 1 },
+            "enabled": { "type": "boolean", "default": true }
+          }
+        }
+      ]
+    },
+
+    "requestSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per-request timeout in milliseconds. Zero disables the timeout."
+        },
+        "followRedirects": { "type": "boolean" },
+        "maxRedirects": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "encodeUrl": { "type": "boolean", "default": true }
+      }
+    },
+
+    "executionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delayBeforeMs": { "type": "integer", "minimum": 0 },
+        "skip": { "$ref": "#/$defs/skipGuard" }
+      }
+    },
+
+    "skipGuard": {
+      "type": "object",
+      "required": ["when", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "when": { "$ref": "#/$defs/executionCondition" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "executionCondition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["literal"],
+          "additionalProperties": false,
+          "properties": { "literal": { "type": "boolean" } }
+        },
+        {
+          "type": "object",
+          "required": ["var"],
+          "additionalProperties": false,
+          "properties": { "var": { "$ref": "#/$defs/executionVariable" } }
+        },
+        {
+          "type": "object",
+          "required": ["not"],
+          "additionalProperties": false,
+          "properties": { "not": { "$ref": "#/$defs/executionCondition" } }
+        },
+        {
+          "type": "object",
+          "required": ["all"],
+          "additionalProperties": false,
+          "properties": {
+            "all": { "type": "array", "items": { "$ref": "#/$defs/executionCondition" } }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["any"],
+          "additionalProperties": false,
+          "properties": {
+            "any": { "type": "array", "items": { "$ref": "#/$defs/executionCondition" } }
+          }
+        }
+      ]
+    },
+
+    "executionVariable": {
+      "type": "object",
+      "required": ["scope", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "enum": ["env", "secret", "runtime"] },
+        "name": { "type": "string", "minLength": 1 }
+      }
     },
 
     "pipelineEntry": {

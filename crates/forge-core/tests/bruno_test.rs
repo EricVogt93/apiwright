@@ -30,6 +30,44 @@ fn imports_collection_metadata_and_collection_auth() {
 }
 
 #[test]
+fn imports_collection_variables_and_reports_collection_scripts() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("bruno.json"), r#"{"name":"Variables"}"#).unwrap();
+    std::fs::write(
+        root.path().join("collection.bru"),
+        "vars {\n  baseUrl: https://api.example.test\n  ~disabled: ignored\n}\nvars:pre-request {\n  bru.setEnvVar(\"token\", \"x\")\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("health.bru"),
+        "get {\n  url: {{baseUrl}}/health\n}\n",
+    )
+    .unwrap();
+
+    let import = import_bruno(root.path()).expect("collection should import");
+
+    assert_eq!(
+        import
+            .collection
+            .variables
+            .get("baseUrl")
+            .map(String::as_str),
+        Some("https://api.example.test")
+    );
+    assert!(!import.collection.variables.contains_key("disabled"));
+    assert!(import
+        .collection
+        .skipped
+        .iter()
+        .any(|issue| issue.contains("variable 'disabled' is disabled")));
+    assert!(import
+        .collection
+        .skipped
+        .iter()
+        .any(|issue| issue.contains("vars:pre-request") && issue.contains("not imported")));
+}
+
+#[test]
 fn orders_items_by_meta_seq_and_reads_folder_auth() {
     let import = import_bruno(&fixture_root()).expect("fixture should import");
     let items = &import.collection.items;
@@ -275,16 +313,22 @@ fn imports_path_params_basic_auth_multipart_and_graphql() {
 }
 
 #[test]
-fn reports_skipped_scripts() {
+fn quarantines_scripts_without_reporting_them_as_dropped() {
     let import = import_bruno(&fixture_root()).expect("fixture should import");
+    assert!(!import
+        .collection
+        .skipped
+        .iter()
+        .any(|message| message.contains("script")));
     assert!(
         import
             .collection
-            .skipped
+            .quarantine
             .iter()
-            .any(|s| s.contains("Charges/Create Charge") && s.contains("script:post-response")),
+            .any(|entry| entry.source_path == "charges/create-charge.bru"
+                && entry.category == forge_core::convert::QuarantineCategory::AfterResponse),
         "{:?}",
-        import.collection.skipped
+        import.collection.quarantine
     );
 }
 
@@ -292,6 +336,8 @@ fn reports_skipped_scripts() {
 fn imports_environments_with_secret_declarations() {
     let import = import_bruno(&fixture_root()).expect("fixture should import");
     assert_eq!(import.environments.len(), 1);
+    assert!(import.collection.secret_variables.contains_key("apiKey"));
+    assert!(import.collection.secret_variables.contains_key("oldToken"));
 
     let (env, secrets) = &import.environments[0];
     assert_eq!(env.name, "staging");

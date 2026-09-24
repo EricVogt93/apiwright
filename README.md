@@ -57,9 +57,9 @@ everyone); the free 60-day commercial trial includes it — see
 | Area | What ApiWright provides |
 | --- | --- |
 | Project view | File-explorer hierarchy, story folders, Git state, branch/worktree actions, inherited Jira links, recursive formatting and export |
-| Request editor | JSON beautification, syntax highlighting, diagnostics, minimap, completion, OpenAPI suggestions, autosave and Zen mode |
+| Request editor | Form and JSON views for the same request, inline query/header/body editing, tests, diagnostics, OpenAPI suggestions and autosave |
 | Response tools | Pretty JSON/XML/HTML, raw view, headers, timing, assertions, runtime variables, diagnostics and trace workspace |
-| Catalog | Built-ins and project assets grouped by intent: Validate, Prepare, Capture, Generate and Simulate |
+| Catalog | Contextual picker for tests, request preparation and project data, with typed parameters and reusable project assets |
 | Assertions | Status, headers, timing, body text/regex, JSONPath value/type/length, cookies, JSON Schema and OpenAPI response validation |
 | Hooks | Request preparation, response processing, extractors, logs, request diffs and runtime-variable changes |
 | Authentication | Basic/Bearer helpers, reusable auth requests, Keycloak/Auth0/Azure presets, expiry-aware refresh before a dependent request |
@@ -71,13 +71,34 @@ everyone); the free 60-day commercial trial includes it — see
 
 Download the latest package from [GitHub Releases](https://github.com/EricVogt93/apiwright/releases):
 
-| Platform | Artifact |
-| --- | --- |
-| Windows x86_64 | `ApiWright-<version>-windows-x86_64.exe` |
-| Linux x86_64 | `ApiWright-<version>-linux-x86_64.AppImage` |
-| macOS Apple Silicon | `ApiWright-<version>-macOS-arm64.dmg` |
+| Platform | GUI | CLI / MCP |
+| --- | --- | --- |
+| Windows x86_64 | `ApiWright-<version>-windows-x86_64.exe` | `ApiWright-<version>-cli-windows-x86_64.exe` |
+| Linux x86_64 | `ApiWright-<version>-linux-x86_64.AppImage` | `ApiWright-<version>-cli-linux-x86_64` |
+| macOS Apple Silicon | `ApiWright-<version>-macOS-arm64.dmg` | `ApiWright-<version>-cli-macOS-arm64` |
 
 Until signed builds are available, Windows SmartScreen and macOS Gatekeeper may show an unknown-publisher warning. Release assets include SHA-256 checksums.
+
+### Codex plugin
+
+From a checkout of a published release, users without Rust can download and
+verify the matching CLI binary before installing the plugin:
+
+```sh
+python3 plugins/apiwright/scripts/stage_binary.py --download
+codex plugin marketplace add .
+codex plugin add apiwright@personal
+```
+
+Developers testing the current checkout build the CLI locally by omitting
+`--download`:
+
+```sh
+python3 plugins/apiwright/scripts/stage_binary.py
+```
+
+See [MCP and AI automation](docs/wiki/mcp.md) for tool behavior and the safe AI
+workflow.
 
 ### Build from source
 
@@ -86,7 +107,7 @@ Install the stable Rust toolchain, then run:
 ```sh
 git clone https://github.com/EricVogt93/apiwright.git
 cd apiwright
-cargo run --release -p forge-gui --bin forge-ide
+cargo run --release -p forge-gui --bin apiwright-ide
 ```
 
 Linux builds also need the native windowing headers:
@@ -200,7 +221,7 @@ k6 run -e BASE_URL=https://staging.example.com -e INCLUDE_MUTATIONS=true k6.js
 
 ## CLI
 
-The `forge` binary is suitable for local scripts and CI:
+The `apiwright` binary is suitable for local scripts and CI:
 
 ```sh
 cargo run -p forge-cli -- validate requests/users/get.request.json --root .
@@ -219,6 +240,26 @@ cargo run -p forge-cli -- import users.forge.json requests
 ApiWright checks the latest published GitHub Release at startup. A newer version opens a changelog dialog where it can be downloaded or skipped; downloaded packages are SHA-256 verified before the platform update flow starts. The release workflow publishes updates from version tags matching the Cargo version, such as `v0.2.0`.
 
 Legacy `forge.json` workspaces remain runnable through `apiwright run`, and `apiwright migrate` / `apiwright migrate-all` convert them without silently dropping unsupported fields.
+
+## AI and MCP
+
+`apiwright mcp` exposes saved request-v1 projects over MCP stdio. AI clients can
+inspect projects, read revisioned requests, update IDE-compatible request
+sidecars, add and remove manual assertions, validate without HTTP, and run
+mocks or explicitly authorized real requests. Secret files stay internal and
+raw response bodies are not returned.
+
+The repository includes a local Codex plugin and skill under
+`plugins/apiwright`. Follow the [Codex plugin installation](#codex-plugin) to
+download a verified release binary or build the current checkout.
+
+The MCP reads saved files. Reload a request in the IDE after an AI write, and do
+not run real HTTP or trusted project JavaScript without reviewing it first.
+Start a new Codex thread after installation so the tools and skill are loaded.
+Codex caches installed plugin versions; after changing the plugin, replace the
+existing SemVer build suffix—or add a `+codex.local-…` suffix—in `plugin.json`,
+stage again, and reinstall. Keep that local suffix uncommitted; CI requires the
+committed plugin version to equal the Cargo workspace version.
 
 ## Architecture
 
@@ -245,7 +286,9 @@ cargo test --workspace --locked
 cargo build --release --workspace
 ```
 
-GitHub Actions runs those checks on pull requests and builds the Windows EXE, Linux AppImage, and macOS DMG on version tags. A tag must match the Cargo version, for example `v0.1.0`.
+GitHub Actions runs those checks on pull requests and builds the GUI and CLI
+release assets for Windows, Linux, and macOS on version tags. A tag must match
+the Cargo version, for example `v0.1.0`.
 
 ## Security and local state
 

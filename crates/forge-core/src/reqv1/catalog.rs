@@ -89,7 +89,7 @@ pub struct ProjectAssetParameter {
 }
 
 use BuiltinIntent::{Capture, Generate, Prepare, Validate};
-use BuiltinParameterKind::{Integer, Json, String as StringParam};
+use BuiltinParameterKind::{Boolean, Integer, Json, String as StringParam};
 use BuiltinTarget::{Binding, Pipeline};
 use PipelinePhase::{AfterResponse, BeforeRequest};
 
@@ -138,15 +138,26 @@ const HEADER: &[BuiltinParameter] = &[
         "trace-123",
     ),
 ];
-const STATUS: &[BuiltinParameter] = &[param(
-    "expected",
-    "Expected status",
-    Integer,
-    true,
-    None,
-    &[],
-    "201",
-)];
+const STATUS: &[BuiltinParameter] = &[
+    param(
+        "expected",
+        "Expected status",
+        Integer,
+        true,
+        None,
+        &[],
+        "201",
+    ),
+    param(
+        "name",
+        "Assertion name",
+        StringParam,
+        false,
+        None,
+        &[],
+        "status is successful",
+    ),
+];
 const JSON_PATH: &[BuiltinParameter] = &[
     param(
         "path",
@@ -167,16 +178,63 @@ const JSON_PATH: &[BuiltinParameter] = &[
         "equals",
     ),
     param("value", "Expected value", Json, false, None, &[], "\"u-1\""),
+    param(
+        "name",
+        "Assertion name",
+        StringParam,
+        false,
+        None,
+        &[],
+        "user id matches",
+    ),
 ];
-const SCHEMA: &[BuiltinParameter] = &[param(
-    "schema",
-    "JSON Schema",
-    Json,
-    true,
-    None,
-    &[],
-    r#"{"type":"object"}"#,
-)];
+const SCHEMA: &[BuiltinParameter] = &[
+    param(
+        "schema",
+        "JSON Schema",
+        Json,
+        false,
+        None,
+        &[],
+        r#"{"type":"object"}"#,
+    ),
+    param(
+        "schemaRef",
+        "JSON Schema file",
+        StringParam,
+        false,
+        None,
+        &[],
+        "../../assets/schemas/api.json",
+    ),
+    param(
+        "definition",
+        "$defs name",
+        StringParam,
+        false,
+        None,
+        &[],
+        "response",
+    ),
+    param(
+        "instancePatch",
+        "Response JSON Patch",
+        Json,
+        false,
+        None,
+        &[],
+        r#"[{"op":"add","path":"/data","value":[]}]"#,
+    ),
+    param(
+        "name",
+        "Assertion name",
+        StringParam,
+        false,
+        None,
+        &[],
+        "response matches contract",
+    ),
+];
 const ASSERT_HEADER: &[BuiltinParameter] = &[
     param(
         "name",
@@ -320,6 +378,15 @@ const EXTRACT_JSON_PATH: &[BuiltinParameter] = &[
         &[],
         "token",
     ),
+    param(
+        "sensitive",
+        "Sensitive output",
+        Boolean,
+        false,
+        Some("false"),
+        &[],
+        "true",
+    ),
 ];
 const EXTRACT_HEADER: &[BuiltinParameter] = &[
     param(
@@ -339,6 +406,15 @@ const EXTRACT_HEADER: &[BuiltinParameter] = &[
         None,
         &[],
         "requestId",
+    ),
+    param(
+        "sensitive",
+        "Sensitive output",
+        Boolean,
+        false,
+        Some("false"),
+        &[],
+        "true",
     ),
 ];
 
@@ -735,6 +811,37 @@ pub(crate) fn validate_builtin(
                 .with_ref(raw));
             }
             _ => {}
+        }
+    }
+    if name == "assert-schema" {
+        match (
+            object.contains_key("schema"),
+            object.contains_key("schemaRef"),
+        ) {
+            (false, false) => {
+                return Err(Diagnostic::new(
+                    Code::InvalidAssetInput,
+                    "JSON Schema validation requires \"schema\" or \"schemaRef\"",
+                )
+                .with_ref(raw));
+            }
+            (true, true) => {
+                return Err(Diagnostic::new(
+                    Code::InvalidAssetInput,
+                    "JSON Schema validation accepts only one of \"schema\" and \"schemaRef\"",
+                )
+                .with_ref(raw));
+            }
+            _ => {}
+        }
+        if let Some(patch) = object.get("instancePatch") {
+            serde_json::from_value::<json_patch::Patch>(patch.clone()).map_err(|error| {
+                Diagnostic::new(
+                    Code::InvalidAssetInput,
+                    format!("instancePatch must be an RFC 6902 JSON Patch: {error}"),
+                )
+                .with_ref(raw)
+            })?;
         }
     }
     if name == "assert-status"

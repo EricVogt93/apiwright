@@ -14,7 +14,10 @@ const MAX_ERRORS: usize = 20;
 /// when invalid, or a single-element `Err` if `schema` itself does not
 /// compile as a valid JSON Schema.
 pub fn validate(schema: &Value, instance: &Value) -> Result<(), Vec<String>> {
-    let validator = match jsonschema::Validator::new(schema) {
+    let validator = match jsonschema::options()
+        .should_validate_formats(true)
+        .build(schema)
+    {
         Ok(v) => v,
         Err(e) => return Err(vec![format!("invalid JSON schema: {e}")]),
     };
@@ -30,6 +33,39 @@ pub fn validate(schema: &Value, instance: &Value) -> Result<(), Vec<String>> {
     } else {
         Err(errors)
     }
+}
+
+/// Validate against one named definition while retaining the complete schema
+/// document as the resolution root for internal `#/$defs/...` references.
+pub fn validate_definition(
+    schema: &Value,
+    definition: &str,
+    instance: &Value,
+) -> Result<(), Vec<String>> {
+    if !schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .is_some_and(|definitions| definitions.contains_key(definition))
+    {
+        return Err(vec![format!(
+            "unknown JSON Schema definition {definition:?}; validation was not run"
+        )]);
+    }
+    let mut selected = schema.clone();
+    let Some(object) = selected.as_object_mut() else {
+        return Err(vec![
+            "invalid JSON schema: document must be an object".to_string()
+        ]);
+    };
+    object.insert(
+        "$ref".to_string(),
+        Value::String(format!("#/$defs/{}", escape_json_pointer(definition))),
+    );
+    validate(&selected, instance)
+}
+
+fn escape_json_pointer(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
 }
 
 #[cfg(test)]
@@ -95,5 +131,77 @@ mod tests {
         let instance = Value::Object(map);
         let errors = validate(&schema, &instance).unwrap_err();
         assert!(errors.len() <= MAX_ERRORS);
+    }
+
+    #[test]
+    fn named_definition_keeps_internal_refs_and_fails_unknown_names_closed() {
+        let schema = json!({
+            "$defs": {
+                "item": {
+                    "type": "object",
+                    "required": ["child"],
+                    "properties": {"child": {"$ref": "#/$defs/child"}}
+                },
+                "child": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {"id": {"type": "integer"}},
+                    "additionalProperties": false
+                }
+            }
+        });
+        assert!(validate_definition(&schema, "item", &json!({"child": {"id": 7}})).is_ok());
+        assert!(validate_definition(&schema, "item", &json!({"child": {"id": "7"}})).is_err());
+        assert!(
+            validate_definition(&schema, "missing", &json!({})).unwrap_err()[0]
+                .contains("unknown JSON Schema definition")
+        );
+    }
+
+    #[test]
+    fn enforces_contract_keywords_and_supported_formats() {
+        let schema = json!({
+            "type": "object",
+            "required": ["dates", "contact", "asciiContact", "labels"],
+            "properties": {
+                "dates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["date", "createdAt"],
+                        "properties": {
+                            "date": {"type": "string", "format": "date"},
+                            "createdAt": {"type": "string", "format": "date-time"}
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "contact": {"type": "string", "format": "idn-email"},
+                "asciiContact": {"type": "string", "format": "email"},
+                "labels": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                }
+            },
+            "additionalProperties": false
+        });
+        assert!(validate(
+            &schema,
+            &json!({
+                "dates": [{"date": "2026-07-28", "createdAt": "2026-07-28T10:00:00Z"}],
+                "contact": "user@b\u{00fc}cher.example",
+                "asciiContact": "user@example.test",
+                "labels": {"kind": "primary"}
+            })
+        )
+        .is_ok());
+        for invalid in [
+            json!({"dates": [], "contact": 7, "asciiContact": "user@example.test", "labels": {}}),
+            json!({"dates": [{"date": "not-a-date", "createdAt": "nope"}], "contact": "bad", "asciiContact": "bad", "labels": {}}),
+            json!({"dates": [], "contact": "user@example.test", "asciiContact": "user@example.test", "labels": {"kind": 7}}),
+            json!({"dates": [], "contact": "user@example.test", "asciiContact": "user@example.test", "labels": {}, "extra": true}),
+        ] {
+            assert!(validate(&schema, &invalid).is_err(), "{invalid}");
+        }
     }
 }

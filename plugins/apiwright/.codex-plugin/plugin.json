@@ -1,0 +1,37 @@
+{
+  "name": "apiwright",
+  "version": "0.5.4",
+  "description": "Inspect, edit, validate, and run ApiWright API test projects from AI.",
+  "author": {
+    "name": "Eric Vogt",
+    "url": "https://github.com/EricVogt93"
+  },
+  "homepage": "https://github.com/EricVogt93/apiwright",
+  "repository": "https://github.com/EricVogt93/apiwright",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "keywords": [
+    "api-testing",
+    "mcp",
+    "openapi"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "ApiWright",
+    "shortDescription": "Work with API test projects from AI",
+    "longDescription": "Inspect, edit, validate, and run saved ApiWright request-v1 projects through the same Rust core used by the IDE and CLI.",
+    "developerName": "Eric Vogt",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Network"
+    ],
+    "websiteURL": "https://github.com/EricVogt93/apiwright",
+    "defaultPrompt": [
+      "Inspect this ApiWright project and report broken references.",
+      "Update this saved request, validate it, then run its mock.",
+      "Run this request only after confirming its external effects."
+    ]
+  }
+}

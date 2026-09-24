@@ -4,6 +4,10 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 
 use crate::model::{ParamKind, RequestDef};
 
+pub(crate) fn encode_lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// RFC 3986 unreserved characters stay unescaped; everything else is
 /// percent-encoded. Matches curl's `--data-urlencode` behaviour.
 const FORM_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
@@ -97,4 +101,14 @@ pub(crate) fn graphql_json_body(
 /// embedded single quotes with the classic `'"'"'` technique.
 pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r#"'"'"'"#))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_lower_hex;
+
+    #[test]
+    fn lower_hex_preserves_leading_zeroes() {
+        assert_eq!(encode_lower_hex(&[0x00, 0xab, 0xff]), "00abff");
+    }
 }

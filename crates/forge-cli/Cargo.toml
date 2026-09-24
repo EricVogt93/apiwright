@@ -19,8 +19,10 @@ forge-core = { path = "../forge-core" }
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tiny_http.workspace = true
+rmcp.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

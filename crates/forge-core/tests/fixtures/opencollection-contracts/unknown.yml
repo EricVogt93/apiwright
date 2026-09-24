@@ -1,0 +1,15 @@
+info:
+  name: Unknown contract
+  type: http
+  seq: 3
+http:
+  method: get
+  url: https://example.test/unknown
+runtime:
+  scripts:
+    - type: tests
+      code: |
+        const { validateContract } = require('./shared/contracts/validate.js');
+        test("unknown contract key is blocked", function() {
+          validateContract('not_present', res.body, expect);
+        });

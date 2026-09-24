@@ -27,8 +27,8 @@ pub struct Scopes<'a> {
     pub secret: &'a (dyn Fn(&str) -> Option<String> + Sync),
 }
 
-/// Collects the concrete secret values that were interpolated, so the result
-/// model and logs can mask them (§8, secret masking).
+/// Collects concrete secret and sensitive-runtime values used during a run,
+/// so public results, responses, diagnostics, and logs can mask them.
 #[derive(Default)]
 pub struct SecretSink {
     pub values: Vec<String>,
@@ -40,6 +40,48 @@ impl SecretSink {
             self.values.push(v.to_string());
         }
     }
+
+    pub(crate) fn record_value(&mut self, value: &Value) {
+        match value {
+            Value::String(value) => self.record(value),
+            Value::Array(values) => {
+                for value in values {
+                    self.record_value(value);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values() {
+                    self.record_value(value);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+}
+
+pub(crate) fn sensitive_name(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    normalized.contains("password")
+        || normalized.contains("passwd")
+        || normalized.contains("secret")
+        || normalized.contains("token")
+        || normalized.contains("api_key")
+        || normalized.contains("apikey")
+        || normalized.contains("private_key")
+        || normalized.contains("credential")
+        || normalized == "authorization"
+        || normalized == "proxy_authorization"
+        || normalized == "cookie"
+        || normalized == "set_cookie"
 }
 
 /// Interpolate every string leaf in `node`. Object keys are never touched.
@@ -152,7 +194,13 @@ fn resolve_var(
         "env" => select(scopes.env, path).ok_or_else(|| missing(expr)),
         "bindings" => select(scopes.bindings, path).ok_or_else(|| missing(expr)),
         "matrix" => select(scopes.matrix, path).ok_or_else(|| missing(expr)),
-        "runtime" => select(scopes.runtime, path).ok_or_else(|| missing(expr)),
+        "runtime" => {
+            let value = select(scopes.runtime, path).ok_or_else(|| missing(expr))?;
+            if path.split('.').next().is_some_and(sensitive_name) {
+                secrets.record_value(&value);
+            }
+            Ok(value)
+        }
         other => Err(Diagnostic::new(
             Code::UnknownNamespace,
             format!("unknown variable namespace {other:?} in ${{{expr}}}"),
@@ -325,5 +373,28 @@ mod tests {
         let out = interpolate(&json!("Bearer ${secret.apiToken}"), &scopes, &mut sink).unwrap();
         assert_eq!(out, json!("Bearer s3cr3t"));
         assert_eq!(sink.values, vec!["s3cr3t".to_string()]);
+    }
+
+    #[test]
+    fn sensitive_runtime_interpolation_is_recorded_for_masking() {
+        let empty = json!({});
+        let runtime = json!({"ipd452_service_token": "runtime-secret"});
+        let no_secret = |_: &str| None;
+        let scopes = Scopes {
+            env: &empty,
+            bindings: &empty,
+            matrix: &empty,
+            runtime: &runtime,
+            secret: &no_secret,
+        };
+        let mut sink = SecretSink::default();
+        let out = interpolate(
+            &json!("Bearer ${runtime.ipd452_service_token}"),
+            &scopes,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(out, json!("Bearer runtime-secret"));
+        assert_eq!(sink.values, vec!["runtime-secret".to_string()]);
     }
 }

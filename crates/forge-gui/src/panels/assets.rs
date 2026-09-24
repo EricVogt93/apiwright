@@ -33,6 +33,7 @@ enum ProjectAction {
     AddFiles(PathBuf),
     Beautify(PathBuf),
     Export(PathBuf, BundleFormat),
+    ExportInterchange(PathBuf, forge_core::reqv1::InterchangeFormat),
     Import(PathBuf),
     Properties(PathBuf),
     Open(PathBuf),
@@ -1021,6 +1022,27 @@ fn export_menu(ui: &mut Ui, source: &Path, action: &mut Option<ProjectAction>) {
             ));
             ui.close();
         }
+        if source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".request.json"))
+        {
+            ui.separator();
+            if ui.button("Postman collection…").clicked() {
+                *action = Some(ProjectAction::ExportInterchange(
+                    source.to_path_buf(),
+                    forge_core::reqv1::InterchangeFormat::Postman,
+                ));
+                ui.close();
+            }
+            if ui.button("Bruno request file…").clicked() {
+                *action = Some(ProjectAction::ExportInterchange(
+                    source.to_path_buf(),
+                    forge_core::reqv1::InterchangeFormat::Bruno,
+                ));
+                ui.close();
+            }
+        }
     });
 }
 
@@ -1245,6 +1267,9 @@ fn handle_project_action(action: ProjectAction, state: &mut AppState) {
         ProjectAction::AddFiles(directory) => add_files(state, &directory),
         ProjectAction::Beautify(directory) => beautify_folder(state, &directory),
         ProjectAction::Export(source, format) => export_path(state, &source, format),
+        ProjectAction::ExportInterchange(source, format) => {
+            export_interchange_path(state, &source, format)
+        }
         ProjectAction::Import(destination) => import_into(state, &destination),
         ProjectAction::Properties(target) => {
             state.assets.properties_environment =
@@ -1305,15 +1330,119 @@ fn export_path(state: &mut AppState, source: &Path, format: BundleFormat) {
     };
     match forge_core::reqv1::export_bundle(&root, source, format, &output) {
         Ok(summary) => {
-            state.status = Some(StatusMessage::info(format!(
+            let message = format!(
                 "Exported {} request(s) and {} file(s) to {}",
                 summary.requests,
                 summary.files,
                 summary.output.display()
-            )));
+            );
+            state.dialogs.export_review.completed(
+                "ApiWright bundle",
+                message.clone(),
+                summary.output.clone(),
+            );
+            state.status = Some(StatusMessage::info(message));
         }
         Err(error) => state.status = Some(StatusMessage::error(error)),
     }
+}
+
+fn export_interchange_path(
+    state: &mut AppState,
+    source: &Path,
+    format: forge_core::reqv1::InterchangeFormat,
+) {
+    let Some(root) = state.assets.root.clone() else {
+        return;
+    };
+    if state.dialogs.v1_editor.has_unsaved_request_under(source) {
+        state.status = Some(StatusMessage::error(
+            "Save the open request before exporting this request",
+        ));
+        return;
+    }
+    let text = match std::fs::read_to_string(source) {
+        Ok(text) => text,
+        Err(error) => {
+            state.status = Some(StatusMessage::error(format!(
+                "cannot read {}: {error}",
+                source.display()
+            )));
+            return;
+        }
+    };
+    let document = match forge_core::reqv1::RequestDocument::parse(&text) {
+        Ok(document) => document,
+        Err(error) => {
+            state.status = Some(StatusMessage::error(format!(
+                "invalid request {}: {error}",
+                source.display()
+            )));
+            return;
+        }
+    };
+    let mut export = match forge_core::reqv1::render_interchange_request(&document, format) {
+        Ok(export) => export,
+        Err(error) => {
+            state.status = Some(StatusMessage::error(error));
+            return;
+        }
+    };
+    if forge_core::reqv1::assertions_path(source).exists() {
+        export
+            .warnings
+            .push("ApiWright assertion sidecars were not exported.".to_string());
+    }
+    if forge_core::reqv1::hooks_path(source).exists() {
+        export
+            .warnings
+            .push("ApiWright hook sidecars were not exported.".to_string());
+    }
+    if forge_core::reqv1::load_project(&root)
+        .ok()
+        .is_some_and(|project| project.auth.is_some())
+    {
+        export.warnings.push(
+            "Project-level authentication was not exported; the target request is explicitly unauthenticated."
+                .to_string(),
+        );
+    }
+    export.warnings.sort();
+    export.warnings.dedup();
+
+    let base = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("request")
+        .strip_suffix(".request.json")
+        .unwrap_or("request");
+    let dialog = rfd::FileDialog::new()
+        .set_directory(source.parent().unwrap_or(&root))
+        .set_file_name(format!("{base}.{}", format.extension()));
+    let output = match format {
+        forge_core::reqv1::InterchangeFormat::Postman => dialog
+            .add_filter("Postman collection JSON", &["json"])
+            .save_file(),
+        forge_core::reqv1::InterchangeFormat::Bruno => {
+            dialog.add_filter("Bruno request", &["bru"]).save_file()
+        }
+    };
+    let Some(output) = output else {
+        return;
+    };
+    let (title, filter) = match format {
+        forge_core::reqv1::InterchangeFormat::Postman => ("Postman", "Postman collection JSON"),
+        forge_core::reqv1::InterchangeFormat::Bruno => ("Bruno", "Bruno request"),
+    };
+    let extension = format.extension().rsplit('.').next().unwrap_or("json");
+    state.dialogs.export_review.prepare(
+        title,
+        output,
+        export.content,
+        export.warnings,
+        filter,
+        extension,
+    );
 }
 
 fn import_into(state: &mut AppState, destination: &Path) {
@@ -1331,9 +1460,14 @@ fn import_into(state: &mut AppState, destination: &Path) {
                 state.git.refresh(&root, true);
             }
             state.status = Some(StatusMessage::info(format!(
-                "Imported {} file(s) below {}",
+                "Imported {} file(s) below {}{}",
                 summary.files.len(),
-                destination.display()
+                destination.display(),
+                if summary.preserved_project_config {
+                    " (kept existing project.json)"
+                } else {
+                    ""
+                }
             )));
         }
         Err(error) => state.status = Some(StatusMessage::error(error)),

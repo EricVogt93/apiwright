@@ -76,7 +76,9 @@ Since landed (originally deferred, all additive):
   `run-sequence` and the IDE execute them in declared order and retain each
   response.
 - **`builtin:assert-schema@1`**: validates the response body against an
-  inline JSON Schema (reuses the crate's `jsonschema` validator).
+  inline JSON Schema or a project-contained `schemaRef`. `definition` selects
+  a named `$defs` entry while retaining the complete document for internal
+  references; supported JSON Schema formats are enforced.
 
 **v1 request editor** (`dialogs/v1_editor.rs`): a self-contained window for
 authoring a `*.request.json` with chill store access — the asset store on the
@@ -149,8 +151,8 @@ by `crates/forge-core/tests/reqv1_test.rs`.
 
 ## 1. Persisted request document model
 
-A request document contains only metadata, bindings, an optional matrix, the HTTP request
-and an optional mock. Hooks and assertions are stored in automatically derived siblings
+A request document contains metadata, bindings, an optional matrix, an optional execution
+policy, the HTTP request, and an optional mock. Hooks and assertions are stored in automatically derived siblings
 (`create.hooks.json` and `create.assertions.json`). Inline pipeline entries remain readable
 for compatibility and are split into those sidecars when the IDE saves the request.
 
@@ -263,10 +265,23 @@ export interface RequestDocument {
   meta: RequestMeta;
   bindings?: Record<string, Binding>;
   matrix?: Record<string, Binding>;
+  execution?: ExecutionPolicy;
   request: RequestSpec;
   pipeline?: PipelineEntry[];
   mock?: MockDef;
 }
+
+export interface ExecutionPolicy {
+  delayBeforeMs?: number;
+  skip?: { when: ExecutionCondition; reason: string };
+}
+
+export type ExecutionCondition =
+  | { literal: boolean }
+  | { var: { scope: "env" | "secret" | "runtime"; name: string } }
+  | { not: ExecutionCondition }
+  | { all: ExecutionCondition[] }
+  | { any: ExecutionCondition[] };
 
 export interface RequestMeta {
   id: string;
@@ -800,19 +815,24 @@ IDE form. The lockfile hashes both executable and metadata.
 ```
 Request JSON
   → 1. Schema validation           (request-v1.schema.json; fail closed)
-  → 2. Reference resolution        (§6 — assets located, loaded, validated)
-  → 3. Binding resolution          (§7 — bindings + matrix, cycle-checked)
-  → 4. Variable resolution         (§8 — namespaced, type-preserving)
-  → 5. Canonical IR                (§4 — fully resolved ResolvedRequest)
-  → 6. Pipeline: beforeRequest     (§9 — hooks patch the IR)
-  → 7. HTTP send   OR   mock       (§10)
-  → 8. Pipeline: afterResponse     (§9 — assertions + extractors)
+  → 2. Conditional skip            (before auth, refs, bindings, or interpolation)
+  → 3. Reference resolution        (§6 — assets located, loaded, validated)
+  → 4. Binding resolution          (§7 — bindings + matrix, cycle-checked)
+  → 5. Variable resolution         (§8 — namespaced, type-preserving)
+  → 6. Canonical IR                (§4 — fully resolved ResolvedRequest)
+  → 7. Pipeline: beforeRequest     (§9 — hooks patch the IR)
+  → 8. Cancellable pre-send delay  (`execution.delayBeforeMs`)
+  → 9. HTTP send   OR   mock       (§10)
+  → 10. Pipeline: afterResponse    (§9 — assertions + extractors)
        (onError / finally as applicable)
-  → 9. Result model                (§17)
+  → 11. Result model               (§17)
 ```
 
-Stages 1–5 are pure and side-effect-free except reads; they can run in CI as a "validate
-only" pass (`apiwright validate`) that never touches the network. Stages 6–8 are the run.
+Skip conditions use Bruno/JavaScript truthiness: missing, null, false, numeric zero, and
+the empty string are false; all other values are true. Secret values are never included
+in diagnostics. A skipped request has no delay, transport, response pipeline, or
+assertions. Otherwise, `durationMs` includes the pre-send delay while HTTP timing remains
+transport-only.
 
 ---
 
@@ -946,7 +966,8 @@ running genuinely untrusted assets is a demonstrated workflow.
 ```ts
 export interface RunResult {
   requestId: string;
-  status: "passed" | "failed" | "error";   // failed = assertion(s) failed; error = threw/transport
+  status: "passed" | "failed" | "error" | "skipped";
+  skipReason?: string;
   matrixCase?: Record<string, unknown>;     // masked
   http?: HttpResultView;                     // status, headers, timing, sizes; body optional/on-demand
   assertions: AssertionResult[];

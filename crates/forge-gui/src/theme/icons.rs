@@ -79,6 +79,8 @@ pub const ERROR: &str = "\u{2716}"; // ✖
 pub const CHECK: &str = "\u{2713}"; // ✓
 /// Warning severity marker.
 pub const WARNING: &str = "\u{26A0}"; // ⚠
+/// Imported JavaScript quarantine.
+pub const QUARANTINE: &str = PROBLEMS;
 /// Tool-window collapse/hide affordance.
 pub const COLLAPSE: &str = "\u{EABA}"; // cod-chrome-minimize
 /// Distraction-free editor mode.

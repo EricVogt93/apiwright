@@ -1,8 +1,8 @@
 # CLI and CI
 
-The `forge` binary is the headless adapter over `forge-core`. Build it with
+The `apiwright` binary is the headless adapter over `forge-core`. Build it with
 `cargo build --release -p forge-cli`; examples below then use
-`target/release/forge`. During development, replace `forge` with
+`target/release/apiwright`. During development, replace `apiwright` with
 `cargo run -p forge-cli --`.
 
 ## Choose the correct runner
@@ -144,12 +144,12 @@ is currently an option of this legacy runner, not `apiwright ci`.
 ## gRPC commands
 
 ```sh
-forge grpc list api.proto -I proto/includes
-forge grpc call api.proto -I proto/includes \
+apiwright grpc list api.proto -I proto/includes
+apiwright grpc call api.proto -I proto/includes \
   --endpoint https://localhost:50051 \
   --method example.Users/GetUser \
   --data @request.json -m 'authorization:Bearer token'
-printf '{"id":"42"}' | forge grpc call api.proto \
+printf '{"id":"42"}' | apiwright grpc call api.proto \
   --endpoint http://localhost:50051 --method example.Users/GetUser --data -
 ```
 
@@ -177,8 +177,8 @@ exit code:
 
 ```sh
 cargo build --release --locked -p forge-cli
-target/release/forge validate requests/health.request.json --root . --env ci
-target/release/forge ci requests --root . --env ci --frozen
+target/release/apiwright validate requests/health.request.json --root . --env ci
+target/release/apiwright ci requests --root . --env ci --frozen
 ```
 
 Minimal GitHub Actions step:
@@ -190,7 +190,7 @@ Minimal GitHub Actions step:
 - name: Run ApiWright regression suite
   env:
     API_TOKEN: ${{ secrets.API_TOKEN }}
-  run: target/release/forge ci --root . --env ci --regression
+  run: target/release/apiwright ci --root . --env ci --regression
 ```
 
 Do not append `|| true` or pipe through a command that hides the runner's

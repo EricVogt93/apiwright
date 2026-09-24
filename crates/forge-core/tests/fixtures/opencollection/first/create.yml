@@ -1,0 +1,54 @@
+info:
+  name: Create user
+  type: http
+  seq: 1
+  tags: [smoke]
+http:
+  method: post
+  url: "{{base_url}}/users/:id?page=1&filter=a b"
+  headers:
+    - name: Content-Type
+      value: application/json
+    - name: X-Local
+      value: "{{local_id}}"
+    - name: X-Disabled
+      value: no
+      disabled: true
+  params:
+    - name: id
+      value: 7
+      type: path
+    - name: verbose
+      value: true
+      type: query
+      enabled: false
+    - name: page
+      value: 1
+      type: query
+    - name: sort
+      value: asc
+      type: query
+  body:
+    type: json
+    data: '{"name":"{{user_name}}"}'
+  auth: inherit
+runtime:
+  variables:
+    - name: local_id
+      value: local-7
+  scripts:
+    - type: after-response
+      code: |
+        bru.setVar("created_id", res.body.id);
+        bru.setVar("created_id", res.body.id);
+    - type: tests
+      code: |
+        expect(res.status).to.equal(201);
+        expect(res.status).to.equal(201);
+settings:
+  encodeUrl: false
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+docs:
+  content: Creates a user.

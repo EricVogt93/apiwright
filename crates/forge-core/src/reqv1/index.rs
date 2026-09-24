@@ -217,6 +217,9 @@ impl ProjectIndex {
 
     fn collect_environments(&mut self, root: &Path) {
         let dir = root.join("environments");
+        if dir.is_symlink() {
+            return;
+        }
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
@@ -396,18 +399,42 @@ fn collect_refs(doc: &RequestDocument) -> Vec<(String, String)> {
     for (name, b) in &doc.matrix {
         binding("/matrix", name, b);
     }
-    if let Some(BodySpec::Ref(r)) = &doc.request.body {
-        out.push(("/request/body/ref".to_string(), r.reference.clone()));
+    match &doc.request.body {
+        Some(BodySpec::Ref(r)) => {
+            out.push(("/request/body/ref".to_string(), r.reference.clone()));
+        }
+        Some(BodySpec::Binary(binary)) => {
+            out.push(("/request/body/file".to_string(), binary.file.clone()));
+        }
+        Some(BodySpec::Multipart(multipart)) => {
+            for (index, part) in multipart.parts.iter().enumerate() {
+                if let super::model::MultipartPart::File { file, .. } = part {
+                    out.push((format!("/request/body/parts/{index}/file"), file.clone()));
+                }
+            }
+        }
+        _ => {}
     }
     for (i, e) in doc.pipeline.iter().enumerate() {
         out.push((format!("/pipeline/{i}/use"), e.uses.clone()));
     }
     match &doc.mock {
-        Some(MockDef::Static(m)) => {
-            if let Some(BodySpec::Ref(r)) = &m.body {
+        Some(MockDef::Static(m)) => match &m.body {
+            Some(BodySpec::Ref(r)) => {
                 out.push(("/mock/body/ref".to_string(), r.reference.clone()));
             }
-        }
+            Some(BodySpec::Binary(binary)) => {
+                out.push(("/mock/body/file".to_string(), binary.file.clone()));
+            }
+            Some(BodySpec::Multipart(multipart)) => {
+                for (index, part) in multipart.parts.iter().enumerate() {
+                    if let super::model::MultipartPart::File { file, .. } = part {
+                        out.push((format!("/mock/body/parts/{index}/file"), file.clone()));
+                    }
+                }
+            }
+            _ => {}
+        },
         Some(MockDef::Dynamic(m)) => out.push(("/mock/use".to_string(), m.uses.clone())),
         None => {}
     }
@@ -436,11 +463,17 @@ fn classify(path: &Path, ext: &str) -> AssetKind {
 }
 
 fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if dir.is_symlink() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let p = entry.path();
+        if p.is_symlink() {
+            continue;
+        }
         if p.is_dir() {
             // Skip hidden/generated/VCS dirs.
             if crate::is_ignored_dir(&entry.file_name().to_string_lossy()) {
@@ -663,5 +696,42 @@ mod tests {
             &root.join("assets/data/users.json"),
         );
         assert_eq!(rel, "../../assets/data/users.json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_scan_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("project.json"), "{}").unwrap();
+        std::fs::create_dir(project.path().join("requests")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("escaped.request.json"),
+            r#"{
+                "formatVersion": 1,
+                "kind": "request",
+                "meta": {"id": "escaped", "name": "Escaped"},
+                "request": {"method": "GET", "url": "https://example.test"}
+            }"#,
+        )
+        .unwrap();
+        symlink(
+            outside.path(),
+            project.path().join("requests").join("outside"),
+        )
+        .unwrap();
+        let outside_assets = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside_assets.path().join("external.js"),
+            "export function run() {}",
+        )
+        .unwrap();
+        symlink(outside_assets.path(), project.path().join("assets")).unwrap();
+
+        let index = ProjectIndex::scan(project.path()).unwrap();
+        assert!(index.requests.is_empty());
+        assert!(index.assets.is_empty());
     }
 }

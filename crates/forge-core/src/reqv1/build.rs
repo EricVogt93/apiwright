@@ -4,18 +4,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 
 use super::catalog::{validate_builtin, BuiltinTarget};
 use super::diag::{Code, Diagnostic, Errors};
 use super::ir::{
-    ResolvedBody, ResolvedHeader, ResolvedMock, ResolvedPipelineEntry, ResolvedRequest,
+    ResolvedBody, ResolvedHeader, ResolvedMock, ResolvedMultipartData, ResolvedMultipartPart,
+    ResolvedPipelineEntry, ResolvedRequest,
 };
-use super::model::{Binding, BodySpec, MockDef, PipelineEntry, RequestDocument, RequestSpec};
+use super::model::{
+    Binding, BodySpec, MockDef, MultipartPart, PipelineEntry, RequestDocument, RequestSpec,
+};
 use super::refs::{RefResolver, RefScheme};
 use super::resolve::DataStore;
-use super::vars::{interpolate, Scopes, SecretSink};
+use super::vars::{interpolate, sensitive_name, Scopes, SecretSink};
 
 /// Everything the builder needs beyond the document itself.
 pub struct BuildInputs<'a> {
@@ -37,6 +41,13 @@ pub struct BuildInputs<'a> {
 pub fn build_ir(doc: &RequestDocument, inp: &BuildInputs<'_>) -> Result<ResolvedRequest, Errors> {
     let mut sink = SecretSink::default();
     let mut errors: Vec<Diagnostic> = Vec::new();
+    if let Some(runtime) = inp.runtime.as_object() {
+        for (name, value) in runtime {
+            if sensitive_name(name) {
+                sink.record_value(value);
+            }
+        }
+    }
 
     // 1. Resolve bindings (topological, cycle-checked, generators run here).
     let bindings = match resolve_bindings(&doc.bindings, inp, &mut sink) {
@@ -90,11 +101,46 @@ pub fn build_ir(doc: &RequestDocument, inp: &BuildInputs<'_>) -> Result<Resolved
         headers: request.headers,
         query: request.query,
         body: request.body,
+        timeout: match doc.request.settings.timeout_ms {
+            Some(0) => None,
+            Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
+            None => Some(Duration::from_secs(30)),
+        },
+        follow_redirects: doc.request.settings.follow_redirects.unwrap_or(true),
+        max_redirects: doc.request.settings.max_redirects.unwrap_or(10),
+        encode_url: doc.request.settings.encode_url.unwrap_or(true),
         pipeline,
         mock,
         bindings,
+        environment: sanitize_context_snapshot(&inp.env, &sink.values),
+        runtime: sanitize_context_snapshot(&inp.runtime, &sink.values),
+        runtime_unmasked: inp.runtime.clone(),
         secret_values: sink.values,
     })
+}
+
+fn sanitize_context_snapshot(value: &Value, secrets: &[String]) -> Value {
+    match value {
+        Value::String(text) => Value::String(mask_text(text, secrets)),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| sanitize_context_snapshot(value, secrets))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .filter(|(name, _)| !sensitive_context_name(name))
+                .map(|(name, value)| (name.clone(), sanitize_context_snapshot(value, secrets)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn sensitive_context_name(name: &str) -> bool {
+    sensitive_name(name)
 }
 
 fn mask_diagnostic(diagnostic: &mut Diagnostic, secrets: &[String]) {
@@ -381,6 +427,88 @@ fn build_body(
     use super::model::BodyType;
     match body {
         None => ResolvedBody::None,
+        Some(BodySpec::Multipart(body)) => {
+            let mut parts = Vec::new();
+            for (index, part) in body.parts.iter().enumerate() {
+                let part_path = format!("/request/body/parts/{index}");
+                match part {
+                    MultipartPart::Text {
+                        name,
+                        value,
+                        filename,
+                        content_type,
+                        enabled,
+                    } => {
+                        if !enabled {
+                            continue;
+                        }
+                        let Some(value) = interp_string(
+                            value,
+                            scopes,
+                            sink,
+                            &format!("{part_path}/value"),
+                            errors,
+                        ) else {
+                            continue;
+                        };
+                        parts.push(ResolvedMultipartPart {
+                            name: name.clone(),
+                            content_type: content_type.clone(),
+                            filename: filename.clone(),
+                            data: ResolvedMultipartData::Text(value),
+                        });
+                    }
+                    MultipartPart::File {
+                        name,
+                        file,
+                        filename,
+                        content_type,
+                        enabled,
+                    } => {
+                        if !enabled {
+                            continue;
+                        }
+                        if let Some(path) =
+                            resolve_body_file(file, inp, &format!("{part_path}/file"), errors)
+                        {
+                            parts.push(ResolvedMultipartPart {
+                                name: name.clone(),
+                                content_type: content_type.clone(),
+                                filename: filename.clone().or_else(|| {
+                                    path.file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                }),
+                                data: ResolvedMultipartData::File(path),
+                            });
+                        }
+                    }
+                }
+            }
+            ResolvedBody::Multipart(parts)
+        }
+        Some(BodySpec::Binary(body)) => {
+            let Some(path) = resolve_body_file(&body.file, inp, "/request/body/file", errors)
+            else {
+                return ResolvedBody::None;
+            };
+            match std::fs::read(&path) {
+                Ok(data) => ResolvedBody::Binary {
+                    content_type: body.content_type.clone(),
+                    data,
+                },
+                Err(error) => {
+                    errors.push(
+                        Diagnostic::new(
+                            Code::AssetNotFound,
+                            format!("cannot read body file {}: {error}", path.display()),
+                        )
+                        .at("/request/body/file")
+                        .with_ref(&body.file),
+                    );
+                    ResolvedBody::None
+                }
+            }
+        }
         Some(BodySpec::Inline(b)) => {
             let value = match &b.value {
                 Some(v) => match interpolate(v, scopes, sink) {
@@ -398,16 +526,6 @@ fn build_body(
                 BodyType::Text => ResolvedBody::Text(value.as_str().unwrap_or("").to_string()),
                 BodyType::Form => ResolvedBody::Form(value_to_form(&value)),
                 BodyType::None => ResolvedBody::None,
-                BodyType::Multipart | BodyType::Binary => {
-                    errors.push(
-                        Diagnostic::new(
-                            Code::InvalidAssetInput,
-                            "multipart/binary bodies are not supported in v1",
-                        )
-                        .at("/request/body"),
-                    );
-                    ResolvedBody::None
-                }
             }
         }
         Some(BodySpec::Ref(r)) => {
@@ -427,6 +545,76 @@ fn build_body(
                     ResolvedBody::None
                 }
             }
+        }
+    }
+}
+
+fn resolve_body_file(
+    reference: &str,
+    inp: &BuildInputs<'_>,
+    instance_path: &str,
+    errors: &mut Vec<Diagnostic>,
+) -> Option<std::path::PathBuf> {
+    let descriptor = match inp.resolver.resolve(reference, inp.base_dir) {
+        Ok(descriptor) => descriptor,
+        Err(mut diagnostic) => {
+            diagnostic.instance_path = Some(instance_path.to_string());
+            errors.push(diagnostic);
+            return None;
+        }
+    };
+    if descriptor.scheme != RefScheme::File
+        || descriptor.pointer.is_some()
+        || descriptor.version.is_some()
+    {
+        errors.push(
+            Diagnostic::new(
+                Code::InvalidAssetInput,
+                "body files must be unversioned project file references without JSON pointers",
+            )
+            .at(instance_path)
+            .with_ref(reference),
+        );
+        return None;
+    }
+    let path = std::path::PathBuf::from(&descriptor.address);
+    match std::fs::canonicalize(&path) {
+        Ok(path) if path.is_file() && path.starts_with(inp.resolver.root()) => Some(path),
+        Ok(path) if !path.starts_with(inp.resolver.root()) => {
+            errors.push(
+                Diagnostic::new(
+                    Code::PathEscape,
+                    format!(
+                        "body file resolves outside the project root: {}",
+                        path.display()
+                    ),
+                )
+                .at(instance_path)
+                .with_ref(reference),
+            );
+            None
+        }
+        Ok(path) => {
+            errors.push(
+                Diagnostic::new(
+                    Code::AssetNotFound,
+                    format!("body file is not a regular file: {}", path.display()),
+                )
+                .at(instance_path)
+                .with_ref(reference),
+            );
+            None
+        }
+        Err(error) => {
+            errors.push(
+                Diagnostic::new(
+                    Code::AssetNotFound,
+                    format!("body file does not exist: {} ({error})", path.display()),
+                )
+                .at(instance_path)
+                .with_ref(reference),
+            );
+            None
         }
     }
 }
@@ -484,6 +672,13 @@ fn build_pipeline(
                 continue;
             }
         }
+        if asset.scheme == RefScheme::Builtin && asset.address == "assert-schema" {
+            if let Err(mut diagnostic) = prepare_schema_input(&mut input, inp, &e.uses) {
+                diagnostic.instance_path = Some(path);
+                errors.push(diagnostic);
+                continue;
+            }
+        }
         if asset.scheme == RefScheme::Builtin {
             if let Err(mut diagnostic) = validate_builtin(
                 &asset.address,
@@ -504,6 +699,64 @@ fn build_pipeline(
         });
     }
     out
+}
+
+fn prepare_schema_input(
+    input: &mut Value,
+    inp: &BuildInputs<'_>,
+    raw: &str,
+) -> Result<(), Diagnostic> {
+    let object = input.as_object_mut().ok_or_else(|| {
+        Diagnostic::new(Code::InvalidAssetInput, "builtin input must be an object").with_ref(raw)
+    })?;
+    if let Some(reference) = object.get("schemaRef").and_then(Value::as_str) {
+        if object.contains_key("schema") {
+            return Err(Diagnostic::new(
+                Code::InvalidAssetInput,
+                "JSON Schema validation accepts only one of \"schema\" and \"schemaRef\"",
+            )
+            .with_ref(raw));
+        }
+        let descriptor = inp.resolver.resolve(reference, inp.base_dir)?;
+        if descriptor.pointer.is_some() {
+            return Err(Diagnostic::new(
+                Code::InvalidAssetInput,
+                "JSON Schema file references do not support JSON pointers; use definition instead",
+            )
+            .with_ref(reference));
+        }
+        let source = std::fs::read(&descriptor.address).map_err(|error| {
+            Diagnostic::new(
+                Code::AssetNotFound,
+                format!("cannot read JSON Schema {}: {error}", descriptor.address),
+            )
+            .with_ref(reference)
+        })?;
+        let schema: Value = serde_json::from_slice(&source).map_err(|error| {
+            Diagnostic::new(
+                Code::InvalidAssetInput,
+                format!("invalid JSON Schema {}: {error}", descriptor.address),
+            )
+            .with_ref(reference)
+        })?;
+        object.insert("schema".to_string(), schema);
+        object.remove("schemaRef");
+    }
+    if let Some(definition) = object.get("definition").and_then(Value::as_str) {
+        if !object
+            .get("schema")
+            .and_then(|schema| schema.get("$defs"))
+            .and_then(Value::as_object)
+            .is_some_and(|definitions| definitions.contains_key(definition))
+        {
+            return Err(Diagnostic::new(
+                Code::InvalidAssetInput,
+                format!("unknown JSON Schema definition {definition:?}"),
+            )
+            .with_ref(raw));
+        }
+    }
+    Ok(())
 }
 
 fn prepare_openapi_input(

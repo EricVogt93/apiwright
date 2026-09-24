@@ -4,7 +4,7 @@
 //! Contract (v1): the file defines a global `function run(ctx, input)`.
 //! `ctx` is a frozen plain object: `{ request, response?, bindings }` —
 //! all JSON. What `run` returns decides its meaning (§5):
-//! - hook (`beforeRequest`):   `{ url?, headers?: [{name,value}] }`
+//! - hook (`beforeRequest`):   `{ url?, headers?, body?, runtime? }`
 //! - assertion (`afterResponse`): `{ passed, message, expected?, actual?,
 //!   path? }` or an array of those
 //! - extractor (`afterResponse`): `{ runtime: { key: value } }`
@@ -13,6 +13,8 @@
 //!
 //! TypeScript is not executable in v1 — a `.ts` asset gets a clear
 //! diagnostic telling the author to ship `.js` (transpile) for now.
+//! Marked imported Bruno assets additionally load the project-contained
+//! `assets/bruno/compat.js` prelude in their fresh context.
 
 use std::time::{Duration, Instant};
 
@@ -50,6 +52,7 @@ pub fn run_js_asset_with_logs(
             format!("cannot read asset {path}: {e}"),
         )
     })?;
+    let compatibility_prelude = bruno_compatibility_prelude(path, input)?;
 
     let runtime = Runtime::new().map_err(|e| host_err(path, &format!("QuickJS start: {e}")))?;
     runtime.set_memory_limit(MEMORY_LIMIT_BYTES);
@@ -60,6 +63,10 @@ pub fn run_js_asset_with_logs(
         Context::full(&runtime).map_err(|e| host_err(path, &format!("QuickJS context: {e}")))?;
 
     context.with(|ctx| -> Result<(Value, Vec<String>), Diagnostic> {
+        if let Some(prelude) = &compatibility_prelude {
+            ctx.eval::<(), _>(prelude.as_bytes())
+                .map_err(|e| asset_err(&ctx, path, e))?;
+        }
         // Define the asset's globals (its `run` function).
         ctx.eval::<(), _>(source.as_bytes())
             .map_err(|e| asset_err(&ctx, path, e))?;
@@ -70,20 +77,24 @@ pub fn run_js_asset_with_logs(
         let call_src = format!(
             r#"(function () {{
                 var __forgeLogs = [];
+                function __forgeConsoleLog() {{
+                    if (__forgeLogs.length >= {max_lines}) return;
+                    var parts = Array.prototype.map.call(arguments, function (value) {{
+                        if (typeof value === "string") return value;
+                        try {{
+                            var json = JSON.stringify(value);
+                            return json === undefined ? String(value) : json;
+                        }} catch (_) {{
+                            return String(value);
+                        }}
+                    }});
+                    __forgeLogs.push(parts.join(" ").slice(0, {max_chars}));
+                }}
                 globalThis.console = Object.freeze({{
-                    log: function () {{
-                        if (__forgeLogs.length >= {max_lines}) return;
-                        var parts = Array.prototype.map.call(arguments, function (value) {{
-                            if (typeof value === "string") return value;
-                            try {{
-                                var json = JSON.stringify(value);
-                                return json === undefined ? String(value) : json;
-                            }} catch (_) {{
-                                return String(value);
-                            }}
-                        }});
-                        __forgeLogs.push(parts.join(" ").slice(0, {max_chars}));
-                    }}
+                    log: __forgeConsoleLog,
+                    info: __forgeConsoleLog,
+                    warn: __forgeConsoleLog,
+                    error: __forgeConsoleLog
                 }});
                 function __deepFreeze(value) {{
                     if (value && typeof value === "object" && !Object.isFrozen(value)) {{
@@ -96,6 +107,23 @@ pub fn run_js_asset_with_logs(
                 }}
                 var __ctx = __deepFreeze(JSON.parse({ctx_lit}));
                 var __input = JSON.parse({input_lit});
+                if ({bruno_compat}) {{
+                    var __Function = globalThis.Function;
+                    if (__Function && __Function.prototype) {{
+                        Object.defineProperty(__Function.prototype, "constructor", {{
+                            value: undefined,
+                            configurable: false,
+                            writable: false
+                        }});
+                    }}
+                    globalThis.eval = undefined;
+                    globalThis.Function = undefined;
+                    globalThis.require = undefined;
+                    globalThis.process = undefined;
+                    globalThis.fetch = undefined;
+                    globalThis.XMLHttpRequest = undefined;
+                    globalThis.WebSocket = undefined;
+                }}
                 if (typeof run !== "function") {{
                     throw new Error("asset must define a global function run(ctx, input)");
                 }}
@@ -109,6 +137,7 @@ pub fn run_js_asset_with_logs(
             max_chars = MAX_LOG_CHARS,
             ctx_lit = js_string_literal(&ctx_text),
             input_lit = js_string_literal(&input_text),
+            bruno_compat = is_bruno_compatibility(input),
         );
         let out: String = ctx
             .eval(call_src.as_bytes())
@@ -130,6 +159,40 @@ pub fn run_js_asset_with_logs(
             .collect();
         Ok((value, logs))
     })
+}
+
+fn bruno_compatibility_prelude(path: &str, input: &Value) -> Result<Option<String>, Diagnostic> {
+    if !is_bruno_compatibility(input) {
+        return Ok(None);
+    }
+    let Some(assets_dir) = std::path::Path::new(path)
+        .ancestors()
+        .find(|candidate| candidate.file_name().and_then(|name| name.to_str()) == Some("assets"))
+    else {
+        return Err(Diagnostic::new(
+            Code::AssetError,
+            format!("{path}: marked Bruno asset is not contained in a project assets directory"),
+        ));
+    };
+    let prelude = assets_dir.join("bruno/compat.js");
+    std::fs::read_to_string(&prelude)
+        .map(Some)
+        .map_err(|error| {
+            Diagnostic::new(
+                Code::AssetError,
+                format!(
+                    "cannot read Bruno compatibility asset {}: {error}",
+                    prelude.display()
+                ),
+            )
+        })
+}
+
+fn is_bruno_compatibility(input: &Value) -> bool {
+    matches!(
+        input.get("compatibility").and_then(Value::as_str),
+        Some("bruno-tests-v1") | Some("bruno-scripts-v1")
+    )
 }
 
 /// Embed arbitrary text as a JS string literal (JSON escaping is valid JS).
@@ -230,6 +293,48 @@ mod tests {
             err.message.contains("must define a global function run"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn bruno_prelude_is_loaded_only_for_marked_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let bruno = dir.path().join("assets/bruno/assertions");
+        std::fs::create_dir_all(&bruno).unwrap();
+        std::fs::write(
+            dir.path().join("assets/bruno/compat.js"),
+            "function __brunoRun(value) { return { passed: value === 7, message: 'compat' }; }",
+        )
+        .unwrap();
+        let path = write_asset(
+            &bruno,
+            "request.tests-1.js",
+            "function run() { var out = __brunoRun(7); out.passed = out.passed && typeof eval === 'undefined' && typeof Function === 'undefined' && (function () {}).constructor === undefined; return out; }",
+        );
+
+        let output = run_js_asset(
+            &path,
+            &json!({}),
+            &json!({"compatibility": "bruno-tests-v1"}),
+        )
+        .unwrap();
+        assert_eq!(output["passed"], true);
+        assert!(run_js_asset(&path, &json!({}), &json!({})).is_err());
+    }
+
+    #[test]
+    fn normal_project_javascript_keeps_its_existing_global_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_asset(
+            dir.path(),
+            "normal.js",
+            r#"function run() {
+                return { evaluated: eval("1 + 1"), constructed: Function("return 3")() };
+            }"#,
+        );
+
+        let output = run_js_asset(&path, &json!({}), &json!({})).unwrap();
+
+        assert_eq!(output, json!({"evaluated": 2, "constructed": 3}));
     }
 
     #[test]

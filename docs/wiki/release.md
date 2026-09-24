@@ -1,8 +1,9 @@
 # Release Guide
 
 ApiWright packages are built by `.github/workflows/release.yml`. A release tag
-produces an x86_64 Linux AppImage, x86_64 Windows executable, Apple Silicon
-macOS DMG and `SHA256SUMS.txt`, then publishes them to a GitHub Release.
+produces the desktop GUI and standalone CLI for x86_64 Linux, x86_64 Windows,
+and Apple Silicon macOS, plus `SHA256SUMS.txt`, then publishes them to a GitHub
+Release.
 
 ## Version source of truth
 
@@ -29,7 +30,8 @@ Run the same checks as repository CI from a clean working tree:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --locked
-cargo check --release --locked -p forge-gui --bin forge-ide
+cargo check --release --locked -p forge-gui --bin apiwright-ide
+cargo check --release --locked -p forge-cli --bin apiwright
 git status --short
 ```
 
@@ -37,7 +39,7 @@ Also open the GUI and run the offline demo for changes touching packaging,
 startup, updates or execution:
 
 ```sh
-cargo run --release -p forge-gui --bin forge-ide
+cargo run --release -p forge-gui --bin apiwright-ide
 cargo run -p forge-cli -- ci requests \
   --root examples/demo-workspace --env demo --mock --allow-project-code
 ```
@@ -54,15 +56,15 @@ only for a tag and waits for every platform. `workflow_dispatch` is useful for
 testing package jobs, but intentionally uploads Actions artifacts without
 creating a GitHub Release.
 
-| Job | Runner | Output |
-| --- | --- | --- |
-| Linux | Ubuntu 22.04 | `ApiWright-<version>-linux-x86_64.AppImage` |
-| Windows | Windows 2025 | `ApiWright-<version>-windows-x86_64.exe` |
-| macOS | macOS 15 | `ApiWright-<version>-macOS-arm64.dmg` |
+| Job | Runner | GUI output | CLI output |
+| --- | --- | --- | --- |
+| Linux | Ubuntu 22.04 | `ApiWright-<version>-linux-x86_64.AppImage` | `ApiWright-<version>-cli-linux-x86_64` |
+| Windows | Windows 2025 | `ApiWright-<version>-windows-x86_64.exe` | `ApiWright-<version>-cli-windows-x86_64.exe` |
+| macOS | macOS 15 | `ApiWright-<version>-macOS-arm64.dmg` | `ApiWright-<version>-cli-macOS-arm64` |
 
 The final job downloads all three artifacts into one directory, runs
-`sha256sum * > SHA256SUMS.txt`, and publishes every file with generated release
-notes.
+`sha256sum * > SHA256SUMS.txt`, and publishes all six platform files and the
+checksum manifest with generated release notes.
 
 ## Platform packaging
 
@@ -86,11 +88,30 @@ shortcut.
 ```
 
 Windows packaging is intentionally simple: CI builds
-`target/release/forge-ide.exe` and copies it to the versioned release name.
+`target/release/apiwright-ide.exe` and copies it to the versioned GUI release
+name. Every platform job also builds `forge-cli` and copies the `apiwright`
+binary to the corresponding versioned CLI release name.
 
 Current packages are not publisher-signed or notarized. Expect Windows
 SmartScreen and macOS Gatekeeper warnings; do not describe the artifacts as
 trusted/signed installers until real signing and notarization are added.
+
+## Standalone CLI and MCP
+
+The CLI release asset runs request projects without the desktop package and
+also contains the local MCP stdio server. On Linux and macOS, mark a downloaded
+CLI asset executable before the first run:
+
+```sh
+chmod +x ./ApiWright-*-cli-linux-x86_64
+./ApiWright-*-cli-linux-x86_64 --version
+./ApiWright-*-cli-linux-x86_64 mcp
+```
+
+For an MCP client, use the absolute path of the downloaded CLI asset as
+`command` and `["mcp"]` as `args`. Project roots are passed to individual MCP
+tools. See [MCP and AI automation](mcp.md) for the client configuration,
+available tools, and safe AI workflow.
 
 ## Auto-update compatibility
 
@@ -119,10 +140,13 @@ specific tag. Skipping does not disable checks for later versions.
 
 After the workflow completes:
 
-1. Confirm the release title/tag and all four downloadable files.
+1. Confirm the release title/tag, all six platform files, and
+   `SHA256SUMS.txt`.
 2. Verify one package against `SHA256SUMS.txt` with `sha256sum -c` or the
    platform equivalent.
-3. Launch each supported package on its target OS.
-4. Confirm **Check for updates** reports the installed version as current.
-5. If any platform job failed, fix the source and publish a new version; do
+3. Launch each GUI package and run the matching CLI with `--version` on its
+   target OS.
+4. Start `apiwright mcp` through an MCP client and list its tools.
+5. Confirm **Check for updates** reports the installed version as current.
+6. If any platform job failed, fix the source and publish a new version; do
    not manually assemble a partial release under the original tag.

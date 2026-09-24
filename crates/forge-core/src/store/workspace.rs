@@ -184,6 +184,7 @@ impl Workspace {
                 ]),
                 secrets: vec!["env".to_string()],
                 auth: None,
+                auth_providers: BTreeMap::new(),
             },
         )?;
         ensure_gitignore(&root)?;

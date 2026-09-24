@@ -6,8 +6,9 @@
 //! headers, query/path params, every body mode, basic/bearer/apikey/oauth2
 //! auth, `assert` blocks (to declarative assertions), `vars:post-response`
 //! extractions and `{{var}}` syntax (shared verbatim) — and reports what it
-//! can't (scripts written against Bruno's `bru`/`req`/`res` JS API,
-//! digest/awsv4/ntlm auth) in [`ImportedCollection::skipped`].
+//! can't execute safely (scripts written against Bruno's `bru`/`req`/`res`
+//! JS API) is preserved in the import quarantine; unsupported auth is listed
+//! in [`ImportedCollection::skipped`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,6 +20,9 @@ use crate::model::{
 };
 
 use super::postman::{ImportedCollection, ImportedItem};
+use super::quarantine::{
+    ImportQuarantineEntry, ImportSourceFormat, QuarantineCategory, QuarantineDisposition,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrunoError {
@@ -52,14 +56,24 @@ pub fn import_bruno(root: &Path) -> Result<BrunoImport, BrunoError> {
 
     let mut skipped = Vec::new();
 
-    // collection.bru: collection-level auth/docs (+ scripts we can't run).
+    // collection.bru: collection-level auth and docs.
     let mut auth = AuthConfig::Inherit;
     let mut description = String::new();
+    let mut variables = BTreeMap::new();
     let collection_bru = root.join("collection.bru");
     if let Ok(text) = std::fs::read_to_string(&collection_bru) {
         let blocks = parse_blocks(&text);
         auth = auth_from_blocks(&blocks, "collection", &mut skipped);
         description = text_block(&blocks, "docs").unwrap_or_default();
+        for (key, value, enabled) in dict_block(&blocks, "vars") {
+            if enabled {
+                variables.insert(key, value);
+            } else {
+                skipped.push(format!(
+                    "collection: variable '{key}' is disabled and was not imported"
+                ));
+            }
+        }
         note_scripts(&blocks, "collection", &mut skipped);
     }
 
@@ -84,18 +98,88 @@ pub fn import_bruno(root: &Path) -> Result<BrunoImport, BrunoError> {
         }
     }
 
+    let mut collection = ImportedCollection {
+        name,
+        description,
+        variables,
+        secret_variables: BTreeMap::new(),
+        auth,
+        hooks: SuiteHooks::default(),
+        items,
+        quarantine: Vec::new(),
+        skipped,
+    };
+    for (environment, _) in &environments {
+        for (name, variable) in &environment.variables {
+            if variable.secret {
+                collection.secret_variables.entry(name.clone()).or_default();
+            }
+        }
+    }
+    collection.quarantine = collect_bruno_quarantine(root)?;
     Ok(BrunoImport {
-        collection: ImportedCollection {
-            name,
-            description,
-            variables: BTreeMap::new(),
-            auth,
-            hooks: SuiteHooks::default(),
-            items,
-            skipped,
-        },
+        collection,
         environments,
     })
+}
+
+fn collect_bruno_quarantine(root: &Path) -> Result<Vec<ImportQuarantineEntry>, BrunoError> {
+    let mut entries = Vec::new();
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.path() == root
+                || entry.file_name().to_str().is_none_or(|name| {
+                    !crate::is_ignored_dir(name)
+                        && !(name == "environments" && entry.path().parent() == Some(root))
+                })
+        })
+    {
+        let entry = entry.map_err(|error| BrunoError::Io {
+            path: error.path().unwrap_or(root).display().to_string(),
+            message: error.to_string(),
+        })?;
+        let file = entry.path();
+        if !entry.file_type().is_file() || file.extension().is_none_or(|ext| ext != "bru") {
+            continue;
+        }
+        let text = std::fs::read_to_string(file).map_err(|error| io_err(file, error))?;
+        let source_path = file
+            .strip_prefix(root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let inherited = matches!(
+            file.file_name().and_then(|name| name.to_str()),
+            Some("collection.bru" | "folder.bru")
+        );
+        for (index, (name, block)) in parse_blocks(&text).iter().enumerate() {
+            let category = match name.as_str() {
+                "script:pre-request" if inherited => QuarantineCategory::BeforeEach,
+                "script:post-response" | "tests" if inherited => QuarantineCategory::AfterEach,
+                "script:pre-request" => QuarantineCategory::BeforeRequest,
+                "script:post-response" => QuarantineCategory::AfterResponse,
+                "tests" => QuarantineCategory::Assertion,
+                _ => continue,
+            };
+            let script = block.as_text();
+            if script.trim().is_empty() {
+                continue;
+            }
+            entries.push(ImportQuarantineEntry::new(
+                ImportSourceFormat::Bruno,
+                category,
+                QuarantineDisposition::ReviewRequired,
+                &source_path,
+                index + 1,
+                script,
+                "Classic Bruno JavaScript has no safe request-v1 compatibility proof and requires review",
+            ));
+        }
+    }
+    Ok(entries)
 }
 
 /// Parse one `environments/*.bru` file: `vars { … }` plus the
@@ -129,6 +213,13 @@ fn read_dir_items(
 
     for entry in std::fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
         let entry = entry.map_err(|e| io_err(dir, e))?;
+        if entry
+            .file_type()
+            .map_err(|error| io_err(&entry.path(), error))?
+            .is_symlink()
+        {
+            continue;
+        }
         let p = entry.path();
         let fname = entry.file_name().to_string_lossy().into_owned();
 
@@ -155,7 +246,6 @@ fn read_dir_items(
                         .and_then(|s| s.parse::<f64>().ok())
                         .unwrap_or(f64::MAX);
                     let item_path = join_path(path, &name);
-                    note_scripts(&blocks, &item_path, skipped);
                     let auth = auth_from_blocks(&blocks, &item_path, skipped);
                     let desc = text_block(&blocks, "docs").unwrap_or_default();
                     (name, seq, auth, desc)
@@ -305,7 +395,6 @@ fn parse_bru_request(
 
     def.assertions = assertions_from_blocks(&blocks, &path, skipped);
     def.extractors = extractors_from_blocks(&blocks, &path, skipped);
-    note_scripts(&blocks, &path, skipped);
 
     (def, seq)
 }
@@ -624,7 +713,12 @@ fn extractors_from_blocks(
 }
 
 fn note_scripts(blocks: &[(String, Block)], path: &str, skipped: &mut Vec<String>) {
-    for name in ["script:pre-request", "script:post-response", "tests"] {
+    for name in [
+        "script:pre-request",
+        "script:post-response",
+        "vars:pre-request",
+        "tests",
+    ] {
         if blocks
             .iter()
             .any(|(n, b)| n == name && !b.as_text().trim().is_empty())
@@ -635,7 +729,6 @@ fn note_scripts(blocks: &[(String, Block)], path: &str, skipped: &mut Vec<String
         }
     }
 }
-
 // ---------------------------------------------------------------------
 // Assert helpers
 // ---------------------------------------------------------------------

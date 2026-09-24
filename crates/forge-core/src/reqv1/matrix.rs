@@ -165,6 +165,23 @@ pub async fn run_matrix_with_responses_in_session(
     cancel: CancellationToken,
     auth: &AuthSession,
 ) -> Result<Vec<(MatrixCase, RunResult, Option<super::pipeline::ResponseView>)>, Errors> {
+    let check_cancelled = || {
+        if cancel.is_cancelled() {
+            Err(Errors(vec![Diagnostic::new(
+                Code::HttpError,
+                "request cancelled",
+            )]))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
+    if !auth.allows_project_code() && doc.uses_project_code() {
+        return Err(Errors(vec![Diagnostic::new(
+            Code::InvalidAssetInput,
+            "request executes project-owned JavaScript, but project code is disabled",
+        )]));
+    }
     let project = load_project(root).map_err(|d| Errors(vec![d]))?;
     let resolver = RefResolver::new(root, &project)?;
     let store = DataStore::new(&resolver);
@@ -173,6 +190,7 @@ pub async fn run_matrix_with_responses_in_session(
 
     let mut results = Vec::with_capacity(cases.len());
     for case in cases {
+        check_cancelled()?;
         let (result, response) = run_with_response_in_session(
             doc,
             root,
@@ -186,6 +204,7 @@ pub async fn run_matrix_with_responses_in_session(
             auth,
         )
         .await;
+        check_cancelled()?;
         results.push((case, result, response));
     }
     Ok(results)

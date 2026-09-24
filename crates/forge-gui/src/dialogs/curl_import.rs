@@ -1,13 +1,14 @@
 //! Import curl (File menu / `Ctrl+Shift+V`): paste a curl command line, get a
-//! live preview, pick where it lands in the collections tree, then create
-//! the request.
+//! live preview, pick where it lands in the workspace, then create the
+//! request.
 
 use egui::{RichText, TextEdit, Ui, Window};
 
 use forge_core::convert::parse_curl;
-use forge_core::model::RequestDef;
+use forge_core::model::{AuthConfig, RequestDef};
 use forge_core::store::{create_request, TreeNode, Workspace};
 
+use super::ImportReportParts;
 use crate::state::{AppState, StatusMessage};
 use crate::widgets::method_badge::method_color;
 
@@ -68,7 +69,12 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     if !state.dialogs.curl_import.open {
         return;
     }
-    let Some(workspace) = state.workspace.clone() else {
+    let workspace = state.workspace.clone();
+    let Some(root) = workspace
+        .as_ref()
+        .map(|workspace| workspace.root.clone())
+        .or_else(|| state.assets.project_root())
+    else {
         // Nothing sensible to import into; drop the dialog rather than show
         // a picker with no options.
         state.dialogs.curl_import.open = false;
@@ -76,7 +82,25 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
         return;
     };
 
-    let targets = target_dirs(&workspace);
+    let request_v1 = root.join("project.json").is_file();
+    let targets = if request_v1 {
+        let requests = root.join("requests");
+        let path = state
+            .assets
+            .selected_directory()
+            .filter(|directory| directory.starts_with(&requests))
+            .unwrap_or(requests);
+        vec![TargetDir {
+            label: path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .display()
+                .to_string(),
+            path,
+        }]
+    } else {
+        workspace.as_ref().map(target_dirs).unwrap_or_default()
+    };
     let parsed = parse_curl(&state.dialogs.curl_import.command);
     if let Ok(def) = &parsed {
         if state.dialogs.curl_import.name.is_empty() {
@@ -115,7 +139,11 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
             ui.separator();
 
             if targets.is_empty() {
-                ui.weak("No collections yet — create one first from the Collections panel.");
+                ui.weak(if request_v1 {
+                    "This project has no request directory to import into."
+                } else {
+                    "No collections yet — create one first from the Collections panel."
+                });
             } else {
                 ui.horizontal(|ui| {
                     ui.label("Target:");
@@ -149,7 +177,7 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                     cancel_clicked = true;
                 }
                 let can_import = parsed.is_ok()
-                    && !targets.is_empty()
+                    && (request_v1 || !targets.is_empty())
                     && !state.dialogs.curl_import.name.trim().is_empty();
                 if ui
                     .add_enabled(can_import, egui::Button::new("Import"))
@@ -168,14 +196,45 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
                 .curl_import
                 .target_idx
                 .min(targets.len().saturating_sub(1));
-            if let Some(target) = targets.get(idx) {
-                match create_request(&target.path, &def) {
+            let target = targets.get(idx).map(|target| target.path.clone());
+            if let Some(target) = target {
+                let result = if request_v1 {
+                    create_request_v1(&root, &target, &def)
+                } else {
+                    create_request(&target, &def).map_err(|error| error.to_string())
+                };
+                match result {
                     Ok(file) => {
-                        let rel_id = workspace.rel_id(&file);
-                        reload_and_open(state, rel_id, def);
-                        state.dialogs.curl_import.open = false;
+                        state.dialogs.import_report.completed(
+                            "curl",
+                            format!("Imported curl request \"{}\".", def.name),
+                            ImportReportParts {
+                                created: if request_v1 {
+                                    vec![file.clone()]
+                                } else {
+                                    Vec::new()
+                                },
+                                created_count: 1,
+                                ..ImportReportParts::default()
+                            },
+                        );
+                        if request_v1 {
+                            state.assets.load(root.clone());
+                            match state.dialogs.v1_editor.open_file(file, None) {
+                                Ok(()) => {
+                                    state.dialogs.curl_import.open = false;
+                                    state.status =
+                                        Some(StatusMessage::info("Imported curl request"));
+                                }
+                                Err(error) => state.status = Some(StatusMessage::error(error)),
+                            }
+                        } else if let Some(workspace) = &workspace {
+                            let rel_id = workspace.rel_id(&file);
+                            reload_and_open(state, rel_id, def);
+                            state.dialogs.curl_import.open = false;
+                        }
                     }
-                    Err(e) => state.status = Some(StatusMessage::error(e.to_string())),
+                    Err(error) => state.status = Some(StatusMessage::error(error)),
                 }
             }
         }
@@ -183,6 +242,69 @@ pub fn show(ctx: &egui::Context, state: &mut AppState) {
     if cancel_clicked || !window_open {
         state.dialogs.curl_import.open = false;
     }
+}
+
+fn create_request_v1(
+    root: &std::path::Path,
+    directory: &std::path::Path,
+    definition: &RequestDef,
+) -> Result<std::path::PathBuf, String> {
+    let requests_root = root.join("requests");
+    if !directory.starts_with(&requests_root) {
+        return Err("request target must be inside the project's requests directory".to_string());
+    }
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let canonical_project = root.canonicalize().map_err(|error| error.to_string())?;
+    let canonical_root = requests_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let directory = directory
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !canonical_root.starts_with(&canonical_project) || !directory.starts_with(&canonical_root) {
+        return Err("request target resolves outside the project".to_string());
+    }
+
+    let mut id = slug(&definition.name);
+    if id.is_empty() {
+        id = "request".to_string();
+    }
+    let mut file = directory.join(format!("{id}.request.json"));
+    let mut suffix = 2;
+    while file.exists() {
+        file = directory.join(format!("{id}-{suffix}.request.json"));
+        suffix += 1;
+    }
+    let mut definition = definition.clone();
+    if definition.auth.is_inherit() {
+        definition.auth = AuthConfig::None;
+    }
+    let document =
+        forge_core::reqv1::migrate_request(&definition, id).map_err(|error| error.to_string())?;
+    forge_core::reqv1::save_request_document(
+        &file,
+        document,
+        forge_core::reqv1::AssertionDocument::default(),
+        forge_core::reqv1::HookDocument::default(),
+        true,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(file)
+}
+
+fn slug(value: &str) -> String {
+    let mut out = String::new();
+    let mut separator = false;
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            separator = false;
+        } else if !separator && !out.is_empty() {
+            out.push('-');
+            separator = true;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 fn preview(ui: &mut Ui, def: &RequestDef) {
@@ -227,4 +349,39 @@ fn reload_and_open(state: &mut AppState, rel_id: String, def: RequestDef) {
     }
     state.open_tab(rel_id, def);
     state.status = Some(StatusMessage::info("Imported curl command"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curl_import_creates_request_v1_documents_with_collision_free_names() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
+        let requests = root.path().join("requests");
+        std::fs::create_dir_all(&requests).unwrap();
+        let mut definition = parse_curl(
+            "curl -X POST 'https://example.test/items?active=true' -H 'content-type: application/json' -d '{\"id\":1}'",
+        )
+        .unwrap();
+        definition.name = "Curl request".to_string();
+
+        let first = create_request_v1(root.path(), &requests, &definition).unwrap();
+        let second = create_request_v1(root.path(), &requests, &definition).unwrap();
+
+        assert_eq!(first.file_name().unwrap(), "curl-request.request.json");
+        assert_eq!(second.file_name().unwrap(), "curl-request-2.request.json");
+        let document = forge_core::reqv1::load_request_document(&first).unwrap();
+        assert_eq!(document.request.method, definition.method);
+        assert_eq!(
+            document.request.url,
+            "https://example.test/items?active=true"
+        );
+        use forge_core::reqv1::model::{BodySpec, BodyType};
+        assert!(matches!(
+            document.request.body,
+            Some(BodySpec::Inline(body)) if body.body_type == BodyType::Json
+        ));
+    }
 }

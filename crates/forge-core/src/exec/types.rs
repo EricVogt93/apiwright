@@ -15,7 +15,8 @@ pub struct ResolvedRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: ResolvedBody,
-    pub timeout: Duration,
+    /// `None` disables both the per-hop and overall request timeout.
+    pub timeout: Option<Duration>,
     pub follow_redirects: bool,
     pub max_redirects: u32,
     pub verify_tls: bool,
@@ -65,7 +66,7 @@ impl ResolvedRequest {
             url: url.into(),
             headers: Vec::new(),
             body: ResolvedBody::None,
-            timeout: Duration::from_secs(30),
+            timeout: Some(Duration::from_secs(30)),
             follow_redirects: true,
             max_redirects: 10,
             verify_tls: true,
@@ -211,6 +212,8 @@ pub struct Hop {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
+    #[error("decoded response exceeds the {limit}-byte limit")]
+    ResponseTooLarge { limit: usize },
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
     #[error("request cancelled")]

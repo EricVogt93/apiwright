@@ -24,7 +24,14 @@ fn selection_file(node: &Path) -> PathBuf {
 }
 
 pub fn own_openapi(node: &Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(selection_file(node)) {
+    let path = selection_file(node);
+    if path.is_symlink() {
+        return Err(format!(
+            "refusing to read OpenAPI selection through symbolic link {}",
+            path.display()
+        ));
+    }
+    match std::fs::read_to_string(path) {
         Ok(value) => Ok((!value.trim().is_empty()).then(|| value.trim().to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!(
@@ -60,6 +67,12 @@ pub fn set_openapi(node: &Path, value: &str) -> Result<(), String> {
         return Err("OpenAPI source must not be empty".to_string());
     }
     let path = selection_file(node);
+    if path.is_symlink() {
+        return Err(format!(
+            "refusing to write OpenAPI selection through symbolic link {}",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -107,5 +120,22 @@ mod tests {
                 .value,
             "specs/root.yaml"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openapi_selection_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), root.path().join(FOLDER_OPENAPI_FILE)).unwrap();
+
+        assert!(own_openapi(root.path())
+            .unwrap_err()
+            .contains("symbolic link"));
+        assert!(set_openapi(root.path(), "specs/openapi.yaml")
+            .unwrap_err()
+            .contains("symbolic link"));
     }
 }

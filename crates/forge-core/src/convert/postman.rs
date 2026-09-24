@@ -3,11 +3,10 @@
 //!
 //! Faithful where the formats overlap (folders, requests, headers, query and
 //! path params, all body modes, basic/bearer/apikey/oauth2 auth, `{{var}}`
-//! syntax is shared verbatim). `pm.*` scripts come over as JavaScript
-//! scripts — the engine ships a `pm` compatibility shim — with request
-//! events mapping to pre/post scripts and folder/collection events to
-//! `beforeEach`/`afterEach` suite hooks. What can't be mapped (saved
-//! example responses, unsupported auth types) is reported in
+//! syntax is shared verbatim). `pm.*` scripts are preserved in the import
+//! quarantine for review but are never attached to executable requests or
+//! suite hooks. What can't be mapped (saved example responses, unsupported
+//! auth types) is reported in
 //! [`ImportedCollection::skipped`] so the caller can show an honest summary
 //! instead of pretending a lossless import.
 
@@ -17,7 +16,11 @@ use serde_json::Value;
 
 use crate::model::{
     ApiKeyPlacement, AuthConfig, BodyDef, EnvVar, Environment, KeyValue, Method, MultipartPart,
-    Param, ParamKind, PartContent, RawLanguage, RequestDef, ScriptLang, SecretValues, SuiteHooks,
+    Param, ParamKind, PartContent, RawLanguage, RequestDef, SecretValues, SuiteHooks,
+};
+
+use super::quarantine::{
+    ImportQuarantineEntry, ImportSourceFormat, QuarantineCategory, QuarantineDisposition,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -37,11 +40,18 @@ pub struct ImportedCollection {
     pub description: String,
     /// Collection-level `{{variables}}` (name → current/initial value).
     pub variables: BTreeMap<String, String>,
+    /// Collection-scoped secret variables kept out of committed metadata.
+    /// Values remain in memory only until the GUI can write the ignored
+    /// sibling secret store.
+    pub secret_variables: SecretValues,
     /// Collection-level auth (`Inherit` when absent).
     pub auth: AuthConfig,
     /// Collection-level lifecycle hooks (from Postman collection events).
     pub hooks: SuiteHooks,
     pub items: Vec<ImportedItem>,
+    /// Imported JavaScript is reviewable but never executable until an
+    /// explicit promotion workflow exists.
+    pub quarantine: Vec<ImportQuarantineEntry>,
     /// Human-readable notes about dropped Postman-only features.
     pub skipped: Vec<String>,
 }
@@ -87,14 +97,41 @@ pub fn parse_postman(text: &str) -> Result<ImportedCollection, PostmanError> {
     }
 
     let mut skipped = Vec::new();
-    let hooks = hooks_from_events(&root);
-    let items = parse_items(&root["item"], "", &mut skipped);
+    let mut quarantine = Vec::new();
+    let collection_identity = info["_postman_id"]
+        .as_str()
+        .map(|id| format!("collection:{id}"))
+        .unwrap_or_else(|| format!("collection:{name}"));
+    quarantine_events(
+        &root,
+        &name,
+        &collection_identity,
+        QuarantineCategory::BeforeEach,
+        QuarantineCategory::AfterEach,
+        &mut quarantine,
+    );
+    let items = parse_items(
+        &root["item"],
+        "",
+        &collection_identity,
+        &mut skipped,
+        &mut quarantine,
+    );
 
     let mut variables = BTreeMap::new();
+    let mut secret_variables = SecretValues::new();
     if let Some(vars) = root["variable"].as_array() {
         for v in vars {
             if let Some(key) = v["key"].as_str() {
-                variables.insert(key.to_string(), value_as_string(&v["value"]));
+                let value = value_as_string(&v["value"]);
+                if v["type"].as_str() == Some("secret") {
+                    secret_variables.insert(key.to_string(), value);
+                    skipped.push(format!(
+                        "collection: secret variable '{key}' is stored separately from the project environment"
+                    ));
+                } else {
+                    variables.insert(key.to_string(), value);
+                }
             }
         }
     }
@@ -105,9 +142,11 @@ pub fn parse_postman(text: &str) -> Result<ImportedCollection, PostmanError> {
         name,
         description: description_text(&info["description"]),
         variables,
+        secret_variables,
         auth,
-        hooks,
+        hooks: SuiteHooks::default(),
         items,
+        quarantine,
         skipped,
     })
 }
@@ -151,11 +190,18 @@ pub fn parse_postman_environment(text: &str) -> Result<(Environment, SecretValue
 // Item tree
 // ---------------------------------------------------------------------
 
-fn parse_items(items: &Value, path: &str, skipped: &mut Vec<String>) -> Vec<ImportedItem> {
+fn parse_items(
+    items: &Value,
+    path: &str,
+    identity: &str,
+    skipped: &mut Vec<String>,
+    quarantine: &mut Vec<ImportQuarantineEntry>,
+) -> Vec<ImportedItem> {
     let Some(arr) = items.as_array() else {
         return Vec::new();
     };
     let mut out = Vec::new();
+    let mut identity_counts = BTreeMap::new();
     for item in arr {
         let name = item["name"].as_str().unwrap_or("Unnamed").to_string();
         let item_path = if path.is_empty() {
@@ -163,17 +209,45 @@ fn parse_items(items: &Value, path: &str, skipped: &mut Vec<String>) -> Vec<Impo
         } else {
             format!("{path}/{name}")
         };
+        let identity_base = postman_item_identity(item, &name);
+        let occurrence = identity_counts
+            .entry(identity_base.clone())
+            .or_insert(0_usize);
+        let item_identity = format!("{identity}/{identity_base}/{}", *occurrence);
+        *occurrence += 1;
 
         if item["item"].is_array() {
             let auth = parse_auth(&item["auth"], &item_path, skipped);
+            quarantine_events(
+                item,
+                &item_path,
+                &item_identity,
+                QuarantineCategory::BeforeEach,
+                QuarantineCategory::AfterEach,
+                quarantine,
+            );
             out.push(ImportedItem::Folder {
                 description: description_text(&item["description"]),
                 auth,
-                hooks: hooks_from_events(item),
-                items: parse_items(&item["item"], &item_path, skipped),
+                hooks: SuiteHooks::default(),
+                items: parse_items(
+                    &item["item"],
+                    &item_path,
+                    &item_identity,
+                    skipped,
+                    quarantine,
+                ),
                 name,
             });
         } else if item["request"].is_object() || item["request"].is_string() {
+            quarantine_events(
+                item,
+                &item_path,
+                &item_identity,
+                QuarantineCategory::BeforeRequest,
+                QuarantineCategory::Assertion,
+                quarantine,
+            );
             out.push(ImportedItem::Request(Box::new(parse_request(
                 item, &item_path, skipped,
             ))));
@@ -223,14 +297,6 @@ fn parse_request(item: &Value, path: &str, skipped: &mut Vec<String>) -> Request
     def.auth = parse_auth(&req["auth"], path, skipped);
     def.body = parse_body(&req["body"], path, skipped);
 
-    // pm.* scripts run on ApiWright's JS engine through the pm compatibility
-    // shim, so events import as regular scripts instead of being dropped.
-    def.scripts.pre_request = event_script(item, "prerequest");
-    def.scripts.post_response = event_script(item, "test");
-    if !def.scripts.is_empty() {
-        def.scripts.language = ScriptLang::Js;
-    }
-
     if item["response"].as_array().is_some_and(|r| !r.is_empty()) {
         skipped.push(format!("{path}: saved example responses not imported"));
     }
@@ -238,44 +304,71 @@ fn parse_request(item: &Value, path: &str, skipped: &mut Vec<String>) -> Request
     def
 }
 
-/// The joined source of the first non-empty script for `listen`
-/// (`prerequest` / `test`), if any. Postman stores `exec` as either an
-/// array of lines or a single string.
-fn event_script(item: &Value, listen: &str) -> Option<String> {
-    let events = item["event"].as_array()?;
-    for ev in events {
-        if ev["listen"].as_str() != Some(listen) || ev["disabled"].as_bool().unwrap_or(false) {
+fn quarantine_events(
+    item: &Value,
+    source_path: &str,
+    source_identity: &str,
+    before_category: QuarantineCategory,
+    after_category: QuarantineCategory,
+    quarantine: &mut Vec<ImportQuarantineEntry>,
+) {
+    let Some(events) = item["event"].as_array() else {
+        return;
+    };
+    let mut event_counts = BTreeMap::new();
+    for (index, event) in events.iter().enumerate() {
+        if event["disabled"].as_bool().unwrap_or(false) {
             continue;
         }
-        let exec = &ev["script"]["exec"];
-        let code = match exec {
-            Value::Array(lines) => lines
-                .iter()
-                .map(|l| l.as_str().unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Value::String(s) => s.clone(),
+        let category = match event["listen"].as_str() {
+            Some("prerequest") => before_category,
+            Some("test") => after_category,
             _ => continue,
         };
-        if !code.trim().is_empty() {
-            return Some(code);
+        let code = match &event["script"]["exec"] {
+            Value::Array(lines) => lines
+                .iter()
+                .map(|line| line.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Value::String(code) => code.clone(),
+            _ => continue,
+        };
+        if code.trim().is_empty() {
+            continue;
         }
+        let listen = event["listen"].as_str().unwrap_or("event");
+        let event_base = event["id"]
+            .as_str()
+            .map(|id| format!("id:{id}"))
+            .unwrap_or_else(|| format!("listen:{listen}"));
+        let occurrence = event_counts.entry(event_base.clone()).or_insert(0_usize);
+        let event_identity = format!("{event_base}/{}", *occurrence);
+        *occurrence += 1;
+        quarantine.push(
+            ImportQuarantineEntry::new(
+                ImportSourceFormat::Postman,
+                category,
+                QuarantineDisposition::ReviewRequired,
+                source_path,
+                index + 1,
+                code,
+                "Postman JavaScript requires review before execution; pm.sendRequest can access arbitrary network targets",
+            )
+            .with_source_identity(format!("{source_identity}/event/{event_identity}")),
+        );
     }
-    None
 }
 
-/// Folder/collection events map onto suite hooks: `prerequest` runs before
-/// every request underneath (→ `beforeEach`), `test` after (→ `afterEach`).
-fn hooks_from_events(item: &Value) -> SuiteHooks {
-    let mut hooks = SuiteHooks {
-        before_each: event_script(item, "prerequest"),
-        after_each: event_script(item, "test"),
-        ..SuiteHooks::default()
-    };
-    if !hooks.is_empty() {
-        hooks.language = ScriptLang::Js;
+fn postman_item_identity(item: &Value, name: &str) -> String {
+    if let Some(id) = item["id"].as_str().or_else(|| item["_postman_id"].as_str()) {
+        return format!("id:{id}");
     }
-    hooks
+    if item["request"].is_null() {
+        format!("folder:{name}")
+    } else {
+        format!("request:{name}")
+    }
 }
 
 /// Split a Postman URL into the raw URL (query string stripped — query
@@ -301,11 +394,13 @@ fn parse_url(url: &Value) -> (String, Vec<Param>) {
         }
     };
 
+    let mut has_structured_query = false;
     if let Some(query) = url["query"].as_array() {
         for q in query {
             let Some(key) = q["key"].as_str() else {
                 continue;
             };
+            has_structured_query = true;
             params.push(Param {
                 kv: KeyValue {
                     key: key.to_string(),
@@ -334,8 +429,31 @@ fn parse_url(url: &Value) -> (String, Vec<Param>) {
         }
     }
 
-    // Query params live in the params table; keep the URL itself clean.
-    let base = raw.split('?').next().unwrap_or(&raw).to_string();
+    // String URLs and Postman exports without a structured query array still
+    // carry their parameters in `raw`. Prefer the structured form when it is
+    // present because it also preserves disabled entries and descriptions.
+    let fragment_start = raw.find('#').unwrap_or(raw.len());
+    let before_fragment = &raw[..fragment_start];
+    let fragment = &raw[fragment_start..];
+    let (base, embedded_query) = before_fragment
+        .split_once('?')
+        .map_or((before_fragment, None), |(base, query)| (base, Some(query)));
+    if !has_structured_query {
+        if let Some(query) = embedded_query {
+            params.extend(
+                url::form_urlencoded::parse(query.as_bytes()).map(|(key, value)| Param {
+                    kv: KeyValue {
+                        key: key.into_owned(),
+                        value: value.into_owned(),
+                        description: String::new(),
+                        enabled: true,
+                    },
+                    kind: ParamKind::Query,
+                }),
+            );
+        }
+    }
+    let base = format!("{base}{fragment}");
     (base, params)
 }
 

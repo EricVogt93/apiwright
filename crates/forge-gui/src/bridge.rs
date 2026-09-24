@@ -29,6 +29,9 @@ pub struct V1RunItem {
 
 pub struct V1RunOutput {
     pub items: Vec<V1RunItem>,
+    pub project_root: PathBuf,
+    pub environment: Option<String>,
+    pub mock: bool,
 }
 
 /// A command sent from the UI thread to the bridge thread.
@@ -40,6 +43,9 @@ pub enum Cmd {
         options: RunOptions,
     },
     Cancel {
+        run_id: u64,
+    },
+    CancelV1 {
         run_id: u64,
     },
     /// Open a WebSocket connection, forwarding events back as `Evt::Ws`.
@@ -185,6 +191,8 @@ pub enum Cmd {
 pub enum Evt {
     Run {
         run_id: u64,
+        workspace_root: PathBuf,
+        environment: Option<String>,
         event: RunEvent,
     },
     /// The run could not even start (bad scope, missing environment, ...).
@@ -324,6 +332,8 @@ fn bridge_main(
         let v1_auth = Arc::new(forge_core::reqv1::AuthSession::default());
         let cancels: Arc<Mutex<HashMap<u64, CancellationToken>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let v1_cancels: Arc<Mutex<HashMap<u64, CancellationToken>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         // Outgoing-message senders for live WebSocket connections, keyed by
         // `conn_id` — the connection's own background task owns the
         // `WsSession`; this is just how `Cmd::WsSend`/`WsClose` reach it.
@@ -344,6 +354,8 @@ fn bridge_main(
                     scope,
                     options,
                 } => {
+                    let workspace_root = workspace.root.clone();
+                    let environment = options.environment.clone();
                     let engine = engine.clone();
                     let evt_tx = evt_tx.clone();
                     let ctx = ctx.clone();
@@ -362,7 +374,12 @@ fn bridge_main(
                         let forward_tx = evt_tx.clone();
                         let forward = tokio::spawn(async move {
                             while let Some(event) = rx.recv().await {
-                                let _ = forward_tx.send(Evt::Run { run_id, event });
+                                let _ = forward_tx.send(Evt::Run {
+                                    run_id,
+                                    workspace_root: workspace_root.clone(),
+                                    environment: environment.clone(),
+                                    event,
+                                });
                                 forward_ctx.request_repaint();
                             }
                         });
@@ -436,8 +453,14 @@ fn bridge_main(
                     let v1_auth = v1_auth.clone();
                     let evt_tx = evt_tx.clone();
                     let ctx = ctx.clone();
+                    let cancels = v1_cancels.clone();
+                    let cancel = CancellationToken::new();
+                    cancels
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(run_id, cancel.clone());
                     tokio::spawn(async move {
-                        let result = run_v1_document(
+                        let work = run_v1_document(
                             &engine,
                             V1RunSpec {
                                 root: &root,
@@ -448,8 +471,17 @@ fn bridge_main(
                                 allow_project_code,
                             },
                             &v1_auth,
-                        )
-                        .await;
+                            cancel.clone(),
+                        );
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err("request cancelled".to_string()),
+                            result = work => result,
+                        };
+                        cancels
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&run_id);
                         let _ = evt_tx.send(Evt::V1Run { run_id, result });
                         ctx.request_repaint();
                     });
@@ -466,17 +498,34 @@ fn bridge_main(
                     let v1_auth = v1_auth.clone();
                     let evt_tx = evt_tx.clone();
                     let ctx = ctx.clone();
+                    let cancels = v1_cancels.clone();
+                    let cancel = CancellationToken::new();
+                    cancels
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(run_id, cancel.clone());
                     tokio::spawn(async move {
-                        let result = run_v1_sequence(
+                        let work = run_v1_sequence(
                             &engine,
-                            &root,
-                            &files,
-                            env_name.as_deref(),
-                            mock,
-                            allow_project_code,
+                            V1GroupSpec {
+                                root: &root,
+                                files: &files,
+                                env_name: env_name.as_deref(),
+                                mock,
+                                allow_project_code,
+                            },
                             &v1_auth,
-                        )
-                        .await;
+                            cancel.clone(),
+                        );
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err("request cancelled".to_string()),
+                            result = work => result,
+                        };
+                        cancels
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&run_id);
                         let _ = evt_tx.send(Evt::V1Run { run_id, result });
                         ctx.request_repaint();
                     });
@@ -493,20 +542,46 @@ fn bridge_main(
                     let v1_auth = v1_auth.clone();
                     let evt_tx = evt_tx.clone();
                     let ctx = ctx.clone();
+                    let cancels = v1_cancels.clone();
+                    let cancel = CancellationToken::new();
+                    cancels
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(run_id, cancel.clone());
                     tokio::spawn(async move {
-                        let result = run_v1_batch(
+                        let work = run_v1_batch(
                             &engine,
-                            &root,
-                            &files,
-                            env_name.as_deref(),
-                            mock,
-                            allow_project_code,
+                            V1GroupSpec {
+                                root: &root,
+                                files: &files,
+                                env_name: env_name.as_deref(),
+                                mock,
+                                allow_project_code,
+                            },
                             &v1_auth,
-                        )
-                        .await;
+                            cancel.clone(),
+                        );
+                        let result = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => Err("request cancelled".to_string()),
+                            result = work => result,
+                        };
+                        cancels
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&run_id);
                         let _ = evt_tx.send(Evt::V1Run { run_id, result });
                         ctx.request_repaint();
                     });
+                }
+                Cmd::CancelV1 { run_id } => {
+                    if let Some(token) = v1_cancels
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&run_id)
+                    {
+                        token.cancel();
+                    }
                 }
                 Cmd::PreviewV1Asset {
                     preview_id,
@@ -788,6 +863,11 @@ fn bridge_main(
                     ctx.request_repaint();
                 }
                 Cmd::Shutdown => {
+                    for registry in [&cancels, &v1_cancels] {
+                        for token in registry.lock().unwrap_or_else(|p| p.into_inner()).values() {
+                            token.cancel();
+                        }
+                    }
                     save_cookies(&engine, &cookie_path);
                     break;
                 }
@@ -808,10 +888,19 @@ struct V1RunSpec<'a> {
     allow_project_code: bool,
 }
 
+struct V1GroupSpec<'a> {
+    root: &'a std::path::Path,
+    files: &'a [PathBuf],
+    env_name: Option<&'a str>,
+    mock: bool,
+    allow_project_code: bool,
+}
+
 async fn run_v1_document(
     engine: &HttpEngine,
     spec: V1RunSpec<'_>,
     auth: &forge_core::reqv1::AuthSession,
+    cancel: CancellationToken,
 ) -> Result<V1RunOutput, String> {
     use forge_core::reqv1::{self, RunMode};
 
@@ -835,15 +924,7 @@ async fn run_v1_document(
         RunMode::Http
     };
     let items = reqv1::run_matrix_with_responses_in_session(
-        &doc,
-        spec.root,
-        spec.file,
-        env,
-        &secret,
-        engine,
-        mode,
-        CancellationToken::new(),
-        auth,
+        &doc, spec.root, spec.file, env, &secret, engine, mode, cancel, auth,
     )
     .await
     .map_err(|errors| errors.to_string())?
@@ -879,18 +960,27 @@ async fn run_v1_document(
             .and_then(|body| serde_json::to_vec(body).ok()),
     })
     .collect();
-    Ok(V1RunOutput { items })
+    Ok(V1RunOutput {
+        items,
+        project_root: spec.root.to_path_buf(),
+        environment: spec.env_name.map(str::to_string),
+        mock: spec.mock,
+    })
 }
 
 async fn run_v1_sequence(
     engine: &HttpEngine,
-    root: &std::path::Path,
-    files: &[PathBuf],
-    env_name: Option<&str>,
-    mock: bool,
-    allow_project_code: bool,
+    spec: V1GroupSpec<'_>,
     auth: &forge_core::reqv1::AuthSession,
+    cancel: CancellationToken,
 ) -> Result<V1RunOutput, String> {
+    let V1GroupSpec {
+        root,
+        files,
+        env_name,
+        mock,
+        allow_project_code,
+    } = spec;
     use forge_core::reqv1::{self, RunMode};
 
     if files.is_empty() {
@@ -898,6 +988,9 @@ async fn run_v1_sequence(
     }
     let mut documents = Vec::with_capacity(files.len());
     for file in files {
+        if cancel.is_cancelled() {
+            return Err("request cancelled".to_string());
+        }
         let document = reqv1::load_request_document(file)?;
         ensure_project_code_allowed(root, &document, allow_project_code)?;
         if !document.matrix.is_empty() {
@@ -930,7 +1023,7 @@ async fn run_v1_sequence(
         &secret,
         engine,
         mode,
-        CancellationToken::new(),
+        cancel,
         auth,
     )
     .await
@@ -962,23 +1055,35 @@ async fn run_v1_sequence(
         }
     })
     .collect();
-    Ok(V1RunOutput { items })
+    Ok(V1RunOutput {
+        items,
+        project_root: root.to_path_buf(),
+        environment: env_name.map(str::to_string),
+        mock,
+    })
 }
 
 async fn run_v1_batch(
     engine: &HttpEngine,
-    root: &std::path::Path,
-    files: &[PathBuf],
-    env_name: Option<&str>,
-    mock: bool,
-    allow_project_code: bool,
+    spec: V1GroupSpec<'_>,
     auth: &forge_core::reqv1::AuthSession,
+    cancel: CancellationToken,
 ) -> Result<V1RunOutput, String> {
+    let V1GroupSpec {
+        root,
+        files,
+        env_name,
+        mock,
+        allow_project_code,
+    } = spec;
     if files.is_empty() {
         return Err("no affected requests found".to_string());
     }
     let mut items = Vec::new();
     for file in files {
+        if cancel.is_cancelled() {
+            return Err("request cancelled".to_string());
+        }
         let text = std::fs::read_to_string(file)
             .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
         let output = run_v1_document(
@@ -992,11 +1097,17 @@ async fn run_v1_batch(
                 allow_project_code,
             },
             auth,
+            cancel.clone(),
         )
         .await?;
         items.extend(output.items);
     }
-    Ok(V1RunOutput { items })
+    Ok(V1RunOutput {
+        items,
+        project_root: root.to_path_buf(),
+        environment: env_name.map(str::to_string),
+        mock,
+    })
 }
 
 fn ensure_project_code_allowed(
@@ -1007,9 +1118,10 @@ fn ensure_project_code_allowed(
     let auth_uses_project_code = if allowed {
         false
     } else {
-        forge_core::reqv1::load_project_auth_document(root)
+        forge_core::reqv1::load_project_auth_documents(root)
             .map_err(|diagnostic| diagnostic.message)?
-            .is_some_and(|(_, document)| document.uses_project_code())
+            .into_iter()
+            .any(|(_, document)| document.uses_project_code())
     };
     if !allowed && (document.uses_project_code() || auth_uses_project_code) {
         Err(
@@ -1128,6 +1240,96 @@ fn restore_cookies(engine: &HttpEngine, json: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_v1_stops_matrix_sequence_and_batch_before_the_next_request() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for mode in ["matrix", "sequence", "batch"] {
+            let server = MockServer::start().await;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let notify = started.clone();
+            Mock::given(path("/first"))
+                .respond_with(move |_: &wiremock::Request| {
+                    notify.notify_one();
+                    ResponseTemplate::new(200)
+                        .set_body_string("ok")
+                        .set_delay(Duration::from_secs(60))
+                })
+                .mount(&server)
+                .await;
+            Mock::given(path("/second"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("must not run"))
+                .mount(&server)
+                .await;
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("project.json"), r#"{"formatVersion":1}"#).unwrap();
+            let first = root.path().join("first.request.json");
+            let second = root.path().join("second.request.json");
+            let document = |name: &str| {
+                serde_json::json!({
+                    "formatVersion":1, "kind":"request", "meta":{"id":name,"name":name},
+                    "request":{"method":"GET","url":format!("{}/{name}", server.uri())}
+                })
+            };
+            let mut doc = document("first");
+            std::fs::write(&first, doc.to_string()).unwrap();
+            std::fs::write(&second, document("second").to_string()).unwrap();
+            let bridge = Bridge::new(egui::Context::default());
+            let command = match mode {
+                "matrix" => {
+                    doc["matrix"] = serde_json::json!({"case":{"value":[1,2]}});
+                    Cmd::RunV1 {
+                        run_id: 41,
+                        root: root.path().to_path_buf(),
+                        file: first,
+                        text: doc.to_string(),
+                        env_name: None,
+                        mock: false,
+                        allow_project_code: false,
+                    }
+                }
+                "sequence" => Cmd::RunV1Sequence {
+                    run_id: 41,
+                    root: root.path().to_path_buf(),
+                    files: vec![first, second],
+                    env_name: None,
+                    mock: false,
+                    allow_project_code: false,
+                },
+                _ => Cmd::RunV1Batch {
+                    run_id: 41,
+                    root: root.path().to_path_buf(),
+                    files: vec![first, second],
+                    env_name: None,
+                    mock: false,
+                    allow_project_code: false,
+                },
+            };
+            bridge.send(command).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), started.notified())
+                .await
+                .expect("first HTTP request must reach server");
+            bridge.send(Cmd::CancelV1 { run_id: 41 }).unwrap();
+            let event = bridge
+                .evt_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("cancellation must complete before HTTP timeout");
+            match event {
+                Evt::V1Run {
+                    run_id,
+                    result: Err(message),
+                } => {
+                    assert_eq!(run_id, 41);
+                    assert!(message.contains("cancelled"), "{mode}: {message}");
+                }
+                _ => panic!("{mode}: expected cancelled V1 run"),
+            }
+            let received = server.received_requests().await.unwrap();
+            assert_eq!(received.len(), 1, "{mode}: no later request may run");
+            assert_eq!(received[0].url.path(), "/first");
+        }
+    }
     use std::time::{Duration, Instant};
 
     use super::*;

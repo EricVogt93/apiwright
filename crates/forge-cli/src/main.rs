@@ -1,3 +1,4 @@
+mod mcp;
 mod print;
 
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve ApiWright project tools over MCP stdio.
+    Mcp,
     /// Run a request, folder, collection or the whole workspace.
     Run(RunArgs),
     /// List every collection, folder and request in a workspace.
@@ -57,6 +60,8 @@ enum Command {
     Export(ExportArgs),
     /// Import a lossless ApiWright JSON/cURL bundle below a destination folder.
     Import(ImportArgs),
+    /// Import Bruno OpenCollection YAML directly as request-format-v1 files.
+    ImportBruno(ImportBrunoArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -86,6 +91,23 @@ struct ImportArgs {
     bundle: PathBuf,
     /// Existing project folder below which bundle paths are restored.
     destination: PathBuf,
+}
+
+#[derive(Args)]
+struct ImportBrunoArgs {
+    /// Bruno collection directory containing opencollection.yml or bruno.json.
+    source: PathBuf,
+    /// Destination request-v1 project directory.
+    destination: PathBuf,
+    /// Inspect the deterministic import plan without writing any files.
+    #[arg(long)]
+    inspect: bool,
+    /// Emit the complete machine-readable report as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Include underscore-prefixed directories such as _probes.
+    #[arg(long)]
+    include_underscore_dirs: bool,
 }
 
 #[derive(Args)]
@@ -294,6 +316,13 @@ struct RunArgs {
 async fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
+        Command::Mcp => match mcp::serve().await {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("MCP server error: {error:#}");
+                2
+            }
+        },
         Command::Run(args) => cmd_run(args).await,
         Command::List(args) => cmd_list(&args.workspace),
         Command::Envs(args) => cmd_envs(&args.workspace),
@@ -312,8 +341,80 @@ async fn main() {
         Command::MigrateAll(args) => cmd_migrate_all(&args),
         Command::Export(args) => cmd_export(&args),
         Command::Import(args) => cmd_import(&args),
+        Command::ImportBruno(args) => cmd_import_bruno(&args),
     };
     std::process::exit(code);
+}
+
+fn cmd_import_bruno(args: &ImportBrunoArgs) -> i32 {
+    let options = forge_core::convert::BrunoV1ImportOptions {
+        inspect: args.inspect,
+        exclude_underscore_dirs: !args.include_underscore_dirs,
+    };
+    match forge_core::convert::import_bruno_v1(&args.source, &args.destination, options) {
+        Ok(report) if args.json => match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                println!("{json}");
+                0
+            }
+            Err(error) => {
+                eprintln!("error: cannot serialize import report: {error}");
+                2
+            }
+        },
+        Ok(report) => {
+            let action = if args.inspect {
+                "would import"
+            } else {
+                "imported"
+            };
+            println!(
+                "{action} {} of {} request(s); {} excluded; {} environment(s); {} output file(s)",
+                report.imported_request_count,
+                report.scanned_request_count,
+                report.excluded_request_count,
+                report.environments.len(),
+                report.output_file_count
+            );
+            println!(
+                "native execution policy: {} skipped request(s), {} delayed request(s)",
+                report.native_skip_request_count, report.native_delay_request_count
+            );
+            println!(
+                "assertion scripts: {} native, {} custom, {} blocked; project code required: {}",
+                report.native_assertion_script_count,
+                report.custom_assertion_script_count,
+                report.blocked_assertion_script_count,
+                report.requires_project_code
+            );
+            println!(
+                "contract assertions: {} direct native, {} transformed native, {} blocked",
+                report.direct_native_contract_assertion_count,
+                report.transformed_native_contract_assertion_count,
+                report.blocked_contract_assertion_count
+            );
+            println!(
+                "auth migration: {} provider(s), {} helper request(s), {} recognized auth script(s) ({} DataManager), {} blocked auth script(s) remaining",
+                report.generated_auth_provider_count,
+                report.generated_helper_request_count,
+                report.recognized_auth_script_count,
+                report.recognized_data_manager_auth_count,
+                report.remaining_blocked_auth_script_count
+            );
+            for (path, features) in &report.diagnostics {
+                for (feature, messages) in features {
+                    for message in messages {
+                        eprintln!("{path} [{feature}]: {message}");
+                    }
+                }
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            2
+        }
+    }
 }
 
 fn cmd_lock(args: &LockArgs) -> i32 {
@@ -550,9 +651,14 @@ fn cmd_import(args: &ImportArgs) -> i32 {
     match forge_core::reqv1::import_bundle(&args.bundle, &args.destination) {
         Ok(summary) => {
             println!(
-                "imported {} file(s) below {}",
+                "imported {} file(s) below {}{}",
                 summary.files.len(),
-                args.destination.display()
+                args.destination.display(),
+                if summary.preserved_project_config {
+                    " (kept existing project.json)"
+                } else {
+                    ""
+                }
             );
             0
         }
@@ -1068,6 +1174,9 @@ async fn cmd_run_v1(args: V1RunArgs, force_batch: bool) -> i32 {
         for d in &result.diagnostics {
             eprintln!("  [{}] {}", d.code, d.message);
         }
+        if let Some(reason) = &result.skip_reason {
+            println!("  skipped: {reason}");
+        }
         println!("{:?}", result.status);
         worst = match (worst, result.status) {
             (_, RunStatus::Error) | (RunStatus::Error, _) => RunStatus::Error,
@@ -1077,6 +1186,7 @@ async fn cmd_run_v1(args: V1RunArgs, force_batch: bool) -> i32 {
     }
     match worst {
         RunStatus::Passed => 0,
+        RunStatus::Skipped => 0,
         RunStatus::Failed => 1,
         RunStatus::Error => 2,
     }

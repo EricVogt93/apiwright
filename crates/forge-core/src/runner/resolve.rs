@@ -66,7 +66,8 @@ pub async fn resolve_request(
     engine: &HttpEngine,
 ) -> Result<ResolvedRequest, ResolveError> {
     let ws_settings = &workspace.meta.settings;
-    let timeout = Duration::from_millis(def.settings.timeout_ms.unwrap_or(ws_settings.timeout_ms));
+    let timeout_ms = def.settings.timeout_ms.unwrap_or(ws_settings.timeout_ms);
+    let timeout = (timeout_ms != 0).then(|| Duration::from_millis(timeout_ms));
     let follow_redirects = def
         .settings
         .follow_redirects

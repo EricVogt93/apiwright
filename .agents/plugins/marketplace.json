@@ -1,0 +1,20 @@
+{
+  "name": "personal",
+  "interface": {
+    "displayName": "ApiWright Local"
+  },
+  "plugins": [
+    {
+      "name": "apiwright",
+      "source": {
+        "source": "local",
+        "path": "./plugins/apiwright"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

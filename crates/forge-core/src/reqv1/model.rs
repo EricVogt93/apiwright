@@ -25,11 +25,125 @@ pub struct RequestDocument {
     pub bindings: BTreeMap<String, Binding>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub matrix: BTreeMap<String, Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionPolicy>,
+    /// Explicit named project auth provider, or `none` to disable auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RequestAuthSelection>,
     pub request: RequestSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pipeline: Vec<PipelineEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mock: Option<MockDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct RequestAuthSelection(String);
+
+impl RequestAuthSelection {
+    pub fn provider(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn none() -> Self {
+        Self("none".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.0 == "none"
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.0.trim().is_empty() {
+            Err("request auth selection must not be empty".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestAuthSelection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let selection = Self(String::deserialize(deserializer)?);
+        selection.validate().map_err(serde::de::Error::custom)?;
+        Ok(selection)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_before_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip: Option<SkipGuard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkipGuard {
+    pub when: ExecutionCondition,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExecutionCondition {
+    Literal(LiteralCondition),
+    Variable(VariableCondition),
+    Not(NotCondition),
+    All(AllCondition),
+    Any(AnyCondition),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiteralCondition {
+    pub literal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VariableCondition {
+    pub var: ExecutionVariable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotCondition {
+    pub not: Box<ExecutionCondition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllCondition {
+    pub all: Vec<ExecutionCondition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnyCondition {
+    pub any: Vec<ExecutionCondition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionVariable {
+    pub scope: ExecutionVariableScope,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionVariableScope {
+    Env,
+    Secret,
+    Runtime,
 }
 
 /// The only supported document format version. Custom (de)serialization
@@ -81,6 +195,28 @@ pub struct RequestSpec {
     pub query: Vec<HeaderSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<BodySpec>,
+    #[serde(default, skip_serializing_if = "RequestTransportSettings::is_default")]
+    pub settings: RequestTransportSettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestTransportSettings {
+    /// Zero explicitly disables the request timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_redirects: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_redirects: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_url: Option<bool>,
+}
+
+impl RequestTransportSettings {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,8 +237,67 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum BodySpec {
+    Multipart(MultipartBody),
+    Binary(BinaryBody),
     Inline(InlineBody),
     Ref(RefBody),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MultipartBody {
+    #[serde(rename = "type")]
+    pub body_type: MultipartBodyType,
+    pub parts: Vec<MultipartPart>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MultipartBodyType {
+    Multipart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum MultipartPart {
+    #[serde(rename_all = "camelCase")]
+    Text {
+        name: String,
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    File {
+        name: String,
+        file: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_type: Option<String>,
+        #[serde(default = "default_true")]
+        enabled: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BinaryBody {
+    #[serde(rename = "type")]
+    pub body_type: BinaryBodyType,
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BinaryBodyType {
+    Binary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,8 +324,6 @@ pub enum BodyType {
     Json,
     Text,
     Form,
-    Multipart,
-    Binary,
     None,
 }
 
@@ -303,6 +496,10 @@ pub struct ProjectConfig {
     /// One project-wide request that supplies short-lived authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<ProjectAuthConfig>,
+    /// Named scoped auth providers. The legacy `auth` field remains the
+    /// fallback when no named provider is selected or matches.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auth_providers: BTreeMap<String, ProjectAuthConfig>,
 }
 
 /// Project-wide auth fetched by running an ordinary request document.
@@ -393,6 +590,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_named_and_disabled_request_auth() {
+        let named = RequestDocument::parse(
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+                "auth":"keycloak","request":{"method":"GET","url":"http://x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(named.auth.unwrap().as_str(), "keycloak");
+
+        let disabled = RequestDocument::parse(
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+                "auth":"none","request":{"method":"GET","url":"http://x"}}"#,
+        )
+        .unwrap();
+        assert!(disabled.auth.unwrap().is_none());
+
+        let empty = r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+            "auth":"","request":{"method":"GET","url":"http://x"}}"#;
+        assert!(RequestDocument::parse(empty).is_err());
+    }
+
+    #[test]
+    fn project_config_keeps_legacy_auth_and_named_providers() {
+        let project: ProjectConfig = serde_json::from_str(
+            r#"{"auth":{"request":"requests/auth/legacy.request.json"},
+                "authProviders":{"admin":{"request":"requests/auth/admin.request.json",
+                "applyTo":"requests/admin"}}}"#,
+        )
+        .unwrap();
+        assert!(project.auth.is_some());
+        assert_eq!(project.auth_providers.len(), 1);
+        assert_eq!(project.auth_providers["admin"].token_path, "$.access_token");
+    }
+
+    #[test]
     fn regression_flag_uses_the_existing_metadata_tags() {
         let mut document = RequestDocument::parse(
             r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x","tags":["smoke"]},
@@ -439,6 +670,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_execution_policy_condition_ast() {
+        let doc = RequestDocument::parse(
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+                "execution":{"delayBeforeMs":5000,"skip":{"reason":"optional dependency",
+                "when":{"any":[{"literal":false},{"not":{"var":{"scope":"secret",
+                "name":"access_token"}}}]}}},
+                "request":{"method":"GET","url":"http://x"}}"#,
+        )
+        .unwrap();
+        let execution = doc.execution.expect("execution policy");
+        assert_eq!(execution.delay_before_ms, Some(5000));
+        assert!(matches!(
+            execution.skip.expect("skip guard").when,
+            ExecutionCondition::Any(_)
+        ));
+    }
+
+    #[test]
     fn parses_canonical_example() {
         let doc =
             include_str!("../../tests/fixtures/reqv1/project/requests/users/create.request.json");
@@ -446,6 +695,37 @@ mod tests {
         assert_eq!(parsed.meta.id, "users.create");
         assert_eq!(parsed.pipeline.len(), 4);
         assert!(parsed.mock.is_some());
+    }
+
+    #[test]
+    fn parses_typed_transport_bodies_and_settings() {
+        let multipart = RequestDocument::parse(
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+                "request":{"method":"POST","url":"http://x","settings":{"timeoutMs":0,
+                "followRedirects":false,"maxRedirects":2,"encodeUrl":false},"body":{
+                "type":"multipart","parts":[{"type":"text","name":"note","value":"hello"},
+                {"type":"file","name":"upload","file":"../assets/a.bin","filename":"a.bin",
+                "contentType":"application/octet-stream","enabled":false}]}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            multipart.request.body,
+            Some(BodySpec::Multipart(_))
+        ));
+        assert_eq!(multipart.request.settings.timeout_ms, Some(0));
+        assert_eq!(multipart.request.settings.encode_url, Some(false));
+
+        let binary = RequestDocument::parse(
+            r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+                "request":{"method":"POST","url":"http://x","body":{"type":"binary",
+                "file":"../assets/a.bin","contentType":"application/octet-stream"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(binary.request.body, Some(BodySpec::Binary(_))));
+
+        let old_magic = r#"{"formatVersion":1,"kind":"request","meta":{"id":"x","name":"x"},
+            "request":{"method":"POST","url":"http://x","body":{"type":"binary","value":"a.bin"}}}"#;
+        assert!(RequestDocument::parse(old_magic).is_err());
     }
 
     #[test]

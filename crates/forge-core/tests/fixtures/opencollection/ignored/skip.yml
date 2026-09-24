@@ -1,0 +1,7 @@
+info:
+  name: Ignored
+  type: http
+  seq: 1
+http:
+  method: get
+  url: https://ignored.test

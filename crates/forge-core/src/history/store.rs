@@ -12,6 +12,9 @@ use crate::exec::ExecutionResult;
 /// `truncated` set to `true` on the row.
 pub const MAX_STORED_BODY_BYTES: usize = 512 * 1024;
 
+/// File name of the per-project history database, under `.forge-local/`.
+pub const HISTORY_DB_FILE: &str = "history.sqlite";
+
 const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +129,49 @@ pub struct HistoryRecord {
     pub env: Option<String>,
     /// See [`HistoryEntry::passed`].
     pub passed: Option<bool>,
+}
+
+impl HistoryRecord {
+    /// Build a body-free history row for a real HTTP request-v1 run.
+    ///
+    /// The URL is copied from the saved definition without template expansion.
+    /// Resolved request/response headers and bodies are intentionally omitted;
+    /// reports need only the run outcome.
+    pub fn from_reqv1_http_run(
+        document: &crate::reqv1::RequestDocument,
+        result: &crate::reqv1::RunResult,
+        env: Option<String>,
+    ) -> Self {
+        let error = (!result.diagnostics.is_empty()).then(|| {
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        });
+
+        Self {
+            executed_at: Utc::now().to_rfc3339(),
+            request_id: result.request_id.clone(),
+            name: document.meta.name.clone(),
+            method: document.request.method.as_str().to_string(),
+            url: document.request.url.clone(),
+            status: result.http.as_ref().map(|http| http.status),
+            duration_ms: result.duration_ms.min(i64::MAX as u64) as i64,
+            request_headers: Vec::new(),
+            request_body: None,
+            response_headers: Vec::new(),
+            response_body: None,
+            error,
+            env,
+            passed: match result.status {
+                crate::reqv1::RunStatus::Passed => Some(true),
+                crate::reqv1::RunStatus::Failed => Some(false),
+                crate::reqv1::RunStatus::Error | crate::reqv1::RunStatus::Skipped => None,
+            },
+        }
+    }
 }
 
 /// SQLite-backed execution history.

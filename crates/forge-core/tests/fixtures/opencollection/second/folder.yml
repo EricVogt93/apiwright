@@ -1,0 +1,5 @@
+info:
+  name: Second
+  type: folder
+  seq: 2
+auth: inherit

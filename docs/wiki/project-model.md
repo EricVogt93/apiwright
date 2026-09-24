@@ -71,6 +71,15 @@ may be workspace-relative or absolute PEM paths.
     "lifetimeSeconds": 900,
     "refreshBeforeSeconds": 30,
     "applyTo": "requests/private"
+  },
+  "authProviders": {
+    "admin": {
+      "request": "requests/auth/admin-token.request.json",
+      "tokenPath": "$.access_token",
+      "lifetimeSeconds": 900,
+      "refreshBeforeSeconds": 30,
+      "applyTo": "requests/admin"
+    }
   }
 }
 ```
@@ -81,11 +90,14 @@ may be workspace-relative or absolute PEM paths.
 | `aliases` | Alias-to-project-path map used by every `ref` and `use`. |
 | `secrets` | Declared secret-provider order. Empty currently falls back to environment lookup. |
 | `auth` | Optional project-wide short-lived bearer-token provider. |
+| `authProviders` | Optional map of named, scoped bearer-token providers. |
 
 The auth defaults are `$.access_token`, 900 seconds, a 30-second refresh reserve and
 `requests` for `applyTo`. `request` must end in `.request.json`; `request` and `applyTo`
 must be non-empty project-relative paths without `..`; the refresh reserve must be less
 than the lifetime. See [Authentication](authentication.md) for refresh behavior.
+
+Request documents may select a named provider with `"auth": "admin"` or disable automatic auth with `"auth": "none"`. Otherwise the most-specific named `applyTo` match is used, with legacy `auth` as the final fallback. Equal-specificity matches fail closed.
 
 The CLI locates a Request Format v1 root by walking upward to the nearest
 `project.json`. The core runner can operate without that file using an empty config,

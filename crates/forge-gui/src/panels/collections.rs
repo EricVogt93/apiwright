@@ -656,7 +656,26 @@ fn apply_pending(state: &mut AppState, pending: PendingAction) {
                 if name.is_empty() {
                     return Ok(None);
                 }
-                rename_folder(dir, &name).map_err(|e| e.to_string())?;
+                let new_dir = rename_folder(dir, &name).map_err(|e| e.to_string())?;
+                if let Some(root) = &root {
+                    let old_prefix = format!("{}/", rel_id_of(root, dir));
+                    let new_prefix = format!("{}/", rel_id_of(root, &new_dir));
+                    for tab in &mut state.tabs {
+                        if let Some(suffix) = tab.rel_id.strip_prefix(&old_prefix) {
+                            tab.rel_id = format!("{new_prefix}{suffix}");
+                        }
+                    }
+                }
+                state.collections.collapsed = state
+                    .collections
+                    .collapsed
+                    .iter()
+                    .map(|path| {
+                        path.strip_prefix(dir)
+                            .map(|suffix| new_dir.join(suffix))
+                            .unwrap_or_else(|_| path.clone())
+                    })
+                    .collect();
             }
             PendingAction::RenameRequest(file, _) => {
                 if name.is_empty() {
@@ -862,6 +881,45 @@ fn flatten_children(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renaming_folder_retargets_dirty_tabs_and_save_does_not_recreate_old_path() {
+        let root = tempfile::tempdir().unwrap();
+        Workspace::create(root.path(), "WS").unwrap();
+        let col = create_collection(root.path(), "Collection").unwrap();
+        let old = create_folder(&col, "Old").unwrap();
+        let nested = create_folder(&old, "Nested").unwrap();
+        let sibling = create_folder(&col, "Old sibling").unwrap();
+        let def = RequestDef::new("Request", Method::Get, "https://example.test");
+        let file = create_request(&nested, &def).unwrap();
+        let sibling_file = create_request(&sibling, &def).unwrap();
+        let mut state = AppState::new();
+        state.workspace = Some(Workspace::load(root.path()).unwrap());
+        state.open_tab(rel_id_of(root.path(), &file), def.clone());
+        state.open_tab(rel_id_of(root.path(), &sibling_file), def);
+        state.tabs[0].dirty = true;
+        state.tabs[0].def.name = "Unsaved edit".into();
+        state.collections.collapsed.insert(nested);
+        state.collections.pending_input = "Renamed".into();
+        apply_pending(
+            &mut state,
+            PendingAction::RenameFolder(old.clone(), "Old".into()),
+        );
+        let new_file = col.join("renamed/nested").join(file.file_name().unwrap());
+        assert_eq!(state.tabs[0].rel_id, rel_id_of(root.path(), &new_file));
+        assert_eq!(state.tabs[1].rel_id, rel_id_of(root.path(), &sibling_file));
+        assert!(state.tabs[0].dirty);
+        assert!(state
+            .collections
+            .collapsed
+            .contains(&col.join("renamed/nested")));
+        crate::app::save_tab(&mut state, 0);
+        assert!(!state.tabs[0].dirty);
+        assert!(!old.exists());
+        let saved: RequestDef = forge_core::store::load_json(&new_file).unwrap();
+        assert_eq!(saved.name, "Unsaved edit");
+    }
+
     use forge_core::store::create_folder;
 
     fn temp_dir(tag: &str) -> PathBuf {

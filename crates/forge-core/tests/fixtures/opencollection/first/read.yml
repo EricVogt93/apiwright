@@ -1,0 +1,11 @@
+info:
+  name: Read user in leaf
+  type: http
+  seq: 2
+  tags: [follow-up]
+http:
+  method: get
+  url: "{{base_url}}/users/{{created_id}}"
+  auth: inherit
+docs:
+  content: Uses runtime state from the prior request in this leaf.

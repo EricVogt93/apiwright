@@ -77,10 +77,12 @@ impl AssertionResult {
 }
 
 /// A change a `beforeRequest` hook makes to the request (§4).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestPatch {
     pub headers: Vec<ResolvedHeader>,
     pub url: Option<String>,
+    pub body: Option<super::ir::ResolvedBody>,
+    pub runtime: BTreeMap<String, Value>,
 }
 
 /// Output of running one `beforeRequest` builtin.
@@ -116,7 +118,7 @@ pub fn run_before_request(
                     name: "Authorization".to_string(),
                     value: format!("{prefix} {token}"),
                 }],
-                url: None,
+                ..RequestPatch::default()
             })
         }
         "basic" => {
@@ -127,7 +129,7 @@ pub fn run_before_request(
                     name: "Authorization".to_string(),
                     value: format!("Basic {token}"),
                 }],
-                url: None,
+                ..RequestPatch::default()
             })
         }
         "header" => Ok(RequestPatch {
@@ -135,7 +137,7 @@ pub fn run_before_request(
                 name: get_str("name"),
                 value: get_str("value"),
             }],
-            url: None,
+            ..RequestPatch::default()
         }),
         other => Err(hook_unknown(other, &entry.asset.raw)),
     }
@@ -169,7 +171,7 @@ pub fn run_after_response(
                     res.status.into(),
                 )
             };
-            Ok((vec![r], BTreeMap::new()))
+            Ok((vec![with_assertion_name(with, r)], BTreeMap::new()))
         }
         "assert-json-path" => {
             let path = with.get("path").and_then(Value::as_str).unwrap_or_default();
@@ -179,7 +181,10 @@ pub fn run_after_response(
                 .unwrap_or("exists");
             let expected = with.get("value").cloned();
             Ok((
-                vec![assert_json_path(res, path, op, expected)],
+                vec![with_assertion_name(
+                    with,
+                    assert_json_path(res, path, op, expected),
+                )],
                 BTreeMap::new(),
             ))
         }
@@ -191,16 +196,36 @@ pub fn run_after_response(
                     Value::Bool(true),
                     Value::Bool(false),
                 ),
-                Some(body) => match crate::assert::schema::validate(&schema, &body) {
-                    Ok(()) => AssertionResult::pass("body matches JSON Schema"),
-                    Err(errors) => AssertionResult::fail(
-                        format!("body does not match schema: {}", errors.join("; ")),
-                        Value::Null,
-                        Value::Array(errors.into_iter().map(Value::from).collect()),
-                    ),
-                },
+                Some(mut body) => {
+                    let patch_error = with.get("instancePatch").and_then(|value| {
+                        serde_json::from_value::<json_patch::Patch>(value.clone())
+                            .map_err(|error| error.to_string())
+                            .and_then(|patch| {
+                                json_patch::patch(&mut body, &patch)
+                                    .map_err(|error| error.to_string())
+                            })
+                            .err()
+                    });
+                    let validation = match patch_error {
+                        Some(error) => Err(vec![format!("response JSON Patch failed: {error}")]),
+                        None => match with.get("definition").and_then(Value::as_str) {
+                            Some(definition) => crate::assert::schema::validate_definition(
+                                &schema, definition, &body,
+                            ),
+                            None => crate::assert::schema::validate(&schema, &body),
+                        },
+                    };
+                    match validation {
+                        Ok(()) => AssertionResult::pass("body matches JSON Schema"),
+                        Err(errors) => AssertionResult::fail(
+                            format!("body does not match schema: {}", errors.join("; ")),
+                            Value::Null,
+                            Value::Array(errors.into_iter().map(Value::from).collect()),
+                        ),
+                    }
+                }
             };
-            Ok((vec![r], BTreeMap::new()))
+            Ok((vec![with_assertion_name(with, r)], BTreeMap::new()))
         }
         "assert-header" => {
             let hname = with.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -403,6 +428,17 @@ pub fn run_after_response(
         )
         .with_ref(&entry.asset.raw)),
     }
+}
+
+fn with_assertion_name(with: &Value, mut result: AssertionResult) -> AssertionResult {
+    if let Some(name) = with.get("name").and_then(Value::as_str) {
+        result.message = if result.passed {
+            name.to_string()
+        } else {
+            format!("{name}: {}", result.message)
+        };
+    }
+    result
 }
 
 fn assert_json_path(
@@ -660,11 +696,15 @@ mod tests {
         .unwrap();
         assert!(r[0].passed);
         let (r, _) = run_after_response(
-            &entry("assert-status", json!({"expected":201})),
+            &entry(
+                "assert-status",
+                json!({"expected":201,"name":"creates a user"}),
+            ),
             &res(500, "{}"),
         )
         .unwrap();
         assert!(!r[0].passed);
+        assert!(r[0].message.starts_with("creates a user:"));
     }
 
     #[test]
@@ -827,9 +867,16 @@ mod tests {
             headers: vec![],
             query: vec![],
             body: super::super::ir::ResolvedBody::None,
+            timeout: Some(std::time::Duration::from_secs(30)),
+            follow_redirects: true,
+            max_redirects: 10,
+            encode_url: true,
             pipeline: vec![],
             mock: None,
             bindings: json!({}),
+            environment: json!({}),
+            runtime: json!({}),
+            runtime_unmasked: json!({}),
             secret_values: vec![],
         };
         let patch = run_before_request(&e, &req).unwrap();
